@@ -1,0 +1,38 @@
+title: confit
+tagline: Config resolution for humans and scripts
+description: Generic TOML config resolver with interpolation and pluggable providers. One file, one tool, all your secrets.
+baseurl: ""
+url: ""
+
+markdown: kramdown
+highlighter: rouge
+
+collections:
+  docs:
+    output: true
+    permalink: /docs/:slug/
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+  - scope:
+      path: ""
+      type: docs
+    values:
+      layout: doc
+  - scope:
+      path: "index.md"
+    values:
+      layout: home
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - Makefile
+
+brand:
+  primary_color: "#111111"
+  accent_color: "#4a4a4a"
+  tagline: "Config resolution for humans and scripts"

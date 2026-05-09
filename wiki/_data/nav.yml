@@ -1,0 +1,16 @@
+- title: Getting Started
+  items:
+    - install
+    - quickstart
+    - commands
+
+- title: Concepts
+  items:
+    - interpolation
+    - shell-eval
+    - providers
+    - variables
+
+- title: Practical
+  items:
+    - recipes

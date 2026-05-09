@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="krondor-corp/confit"
+BINARY="confit"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+
+main() {
+    local os arch version url tmp
+
+    os="$(detect_os)"
+    arch="$(detect_arch)"
+    version="$(latest_version)"
+
+    echo "Installing ${BINARY} ${version} (${arch}-${os})..."
+
+    url="https://github.com/${REPO}/releases/download/${version}/${BINARY}-${version}-${arch}-${os}.tar.gz"
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp}"' EXIT
+
+    curl -fsSL "${url}" | tar -xz -C "${tmp}"
+    mkdir -p "${INSTALL_DIR}"
+    mv "${tmp}"/${BINARY}-${version}-${arch}-${os}/${BINARY} "${INSTALL_DIR}/${BINARY}"
+    chmod +x "${INSTALL_DIR}/${BINARY}"
+
+    echo "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
+
+    if ! echo ":${PATH}:" | grep -q ":${INSTALL_DIR}:"; then
+        echo ""
+        echo "Add to your PATH:"
+        echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+    fi
+}
+
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)  echo "linux" ;;
+        Darwin*) echo "darwin" ;;
+        *)       echo "Unsupported OS: $(uname -s)" >&2; exit 1 ;;
+    esac
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "x86_64" ;;
+        arm64|aarch64) echo "aarch64" ;;
+        *)             echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+}
+
+latest_version() {
+    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        | grep '"tag_name"' \
+        | head -1 \
+        | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+}
+
+main

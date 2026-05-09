@@ -1,0 +1,182 @@
+name: Create Release PR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  release-pr:
+    name: Create/Update Release PR
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, 'Bump confit-')"
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Install cargo-smart-release
+        run: cargo install cargo-smart-release
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Check if release is needed and determine bump type
+        id: check
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 --match "v*" 2>/dev/null || echo "")
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No previous release found, will create initial release"
+            echo "needs_release=true" >> $GITHUB_OUTPUT
+            echo "bump_type=minor" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Latest release tag: $LATEST_TAG"
+
+          BREAKING=$(git log "$LATEST_TAG"..HEAD --oneline -E --grep="^feat!:|^fix!:|BREAKING CHANGE" | wc -l | tr -d ' ')
+          FEATURES=$(git log "$LATEST_TAG"..HEAD --oneline --grep="^feat" | wc -l | tr -d ' ')
+          FIXES=$(git log "$LATEST_TAG"..HEAD --oneline --grep="^fix" | wc -l | tr -d ' ')
+
+          echo "Breaking changes: $BREAKING, Features: $FEATURES, Fixes: $FIXES"
+
+          if [ "$BREAKING" -gt 0 ]; then
+            echo "bump_type=major" >> $GITHUB_OUTPUT
+            echo "needs_release=true" >> $GITHUB_OUTPUT
+          elif [ "$FEATURES" -gt 0 ]; then
+            echo "bump_type=minor" >> $GITHUB_OUTPUT
+            echo "needs_release=true" >> $GITHUB_OUTPUT
+          elif [ "$FIXES" -gt 0 ]; then
+            echo "bump_type=patch" >> $GITHUB_OUTPUT
+            echo "needs_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "No conventional commits since $LATEST_TAG - skipping release PR"
+            echo "needs_release=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create/update release branch
+        if: steps.check.outputs.needs_release == 'true'
+        run: |
+          git fetch origin
+          if git ls-remote --heads origin release-automation | grep -q release-automation; then
+            git push origin --delete release-automation || true
+          fi
+
+          git checkout -b release-automation
+
+      - name: Bump version in Cargo.toml files
+        if: steps.check.outputs.needs_release == 'true'
+        run: |
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "Current version: $CURRENT"
+
+          MAJOR=$(echo $CURRENT | cut -d. -f1)
+          MINOR=$(echo $CURRENT | cut -d. -f2)
+          PATCH=$(echo $CURRENT | cut -d. -f3)
+
+          case "${{ steps.check.outputs.bump_type }}" in
+            major)
+              NEW_VERSION="$((MAJOR + 1)).0.0"
+              ;;
+            minor)
+              NEW_VERSION="${MAJOR}.$((MINOR + 1)).0"
+              ;;
+            patch)
+              NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+              ;;
+          esac
+
+          echo "New version: $NEW_VERSION"
+
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEW_VERSION\"/" Cargo.toml
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEW_VERSION\"/" crates/confit-cli/Cargo.toml
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEW_VERSION\"/" crates/confit-core/Cargo.toml
+
+          git add Cargo.toml crates/*/Cargo.toml
+          git commit -m "chore: bump version to $NEW_VERSION"
+
+      - name: Run cargo smart-release for changelogs
+        if: steps.check.outputs.needs_release == 'true'
+        run: |
+          cargo smart-release confit-cli \
+            --execute \
+            --no-publish \
+            --no-tag \
+            --allow-dirty \
+            --update-crates-index \
+            --bump keep
+
+      - name: Push release branch
+        if: steps.check.outputs.needs_release == 'true'
+        run: |
+          git push -u origin release-automation --force
+
+      - name: Create or update PR
+        if: steps.check.outputs.needs_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUM=$(gh pr list --head release-automation --base main --json number --jq '.[0].number')
+
+          CLI_VERSION=$(grep "^version" Cargo.toml | head -1 | cut -d'"' -f2)
+
+          PR_BODY="## Release Updates
+
+          This PR contains automated version bumps and changelog updates.
+
+          ### New version:
+          - confit v$CLI_VERSION
+
+          ### What happens when merged:
+          1. A \`v$CLI_VERSION\` tag will be created automatically
+          2. Binary releases will be built for all platforms
+          3. A GitHub Release will be published
+
+          ### What to review:
+          - Version bumps in \`Cargo.toml\` files
+          - \`CHANGELOG.md\` updates
+          - Ensure conventional commits are categorized correctly
+
+          ---
+          Generated by [Release PR Workflow](.github/workflows/release-pr.yml)"
+
+          if [ -z "$PR_NUM" ]; then
+            gh pr create \
+              --base main \
+              --head release-automation \
+              --title "chore: release updates" \
+              --body "$PR_BODY"
+            echo "Created new release PR"
+          else
+            gh pr edit "$PR_NUM" --body "$PR_BODY"
+            echo "Updated existing release PR #$PR_NUM"
+          fi

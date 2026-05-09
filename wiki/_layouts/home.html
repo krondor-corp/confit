@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  {% include head.html %}
+</head>
+<body>
+  {% include header.html %}
+  <main class="home">
+
+    <section class="hero">
+      <span class="hero-eyebrow">Config resolution for humans and scripts</span>
+      <h1 class="hero-title">confit</h1>
+      <p class="hero-tagline">One TOML file with interpolation and pluggable providers. Resolve secrets, inject env vars, run commands &mdash; no more sourcing dotfiles.</p>
+      <div class="hero-install" id="hero-install">
+        <code>curl -fsSL https://raw.githubusercontent.com/krondor-corp/confit/main/install.sh | bash</code>
+        <button class="copy-btn copy-btn-visible" onclick="navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/krondor-corp/confit/main/install.sh | bash').then(function(){var b=document.querySelector('#hero-install .copy-btn');b.textContent='copied';setTimeout(function(){b.textContent='copy'},1500)})">copy</button>
+      </div>
+      <div class="hero-links">
+        <a href="{{ '/docs/install/' | relative_url }}" class="hero-cta">Get started</a>
+        <a href="https://github.com/krondor-corp/confit" class="hero-link">View on GitHub</a>
+      </div>
+    </section>
+
+    <section class="features">
+      <div class="feature-grid">
+        <div class="feature">
+          <h3>Resolve</h3>
+          <p>Config values with <code>{path.to.value}</code> interpolation, <code>$(...)</code> shell eval, and pluggable <code>scheme://</code> providers.</p>
+        </div>
+        <div class="feature">
+          <h3>Protect</h3>
+          <p>Wrap any value with <code>secret://</code> to mask it in output. Transparent to <code>run</code> and <code>ssh</code>.</p>
+        </div>
+        <div class="feature">
+          <h3>Run</h3>
+          <p>Inject resolved config as environment variables and exec your command. Keys never touch disk.</p>
+        </div>
+      </div>
+    </section>
+
+
+  </main>
+  {% include footer.html %}
+</body>
+</html>

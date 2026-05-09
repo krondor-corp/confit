@@ -1,0 +1,17 @@
+[package]
+name = "confit-core"
+description = "Core config resolution library for confit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+toml.workspace = true
+regex.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+ssh-key.workspace = true
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

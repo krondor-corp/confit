@@ -1,0 +1,10 @@
+/target
+/wiki-copy
+/SSH_AGENT_DESIGN.md
+*.swp
+*.swo
+*~
+.DS_Store
+wiki/_site
+wiki/.jekyll-cache
+wiki/.sass-cache

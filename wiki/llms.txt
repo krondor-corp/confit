@@ -1,0 +1,18 @@
+---
+layout: null
+permalink: /llms.txt
+---
+# {{ site.title }}
+
+> {{ site.description }}
+
+The full docs in a single file: [/llms-full.txt](/llms-full.txt)
+
+Per-page raw markdown is available at `/docs/<slug>/raw.txt`.
+
+{% for section in site.data.nav %}
+## {{ section.title }}
+
+{% for slug in section.items %}{% assign doc = site.docs | where: "slug", slug | first %}{% if doc %}- [{{ doc.title }}](/docs/{{ slug }}/raw.txt)
+{% endif %}{% endfor %}
+{% endfor %}

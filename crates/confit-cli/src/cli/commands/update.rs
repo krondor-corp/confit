@@ -64,7 +64,11 @@ impl Op for Update {
         }
 
         if newer {
-            ui::progress(&format!("{} → {}", ui::dim(current), ui::highlight(&latest)));
+            ui::progress(&format!(
+                "{} → {}",
+                ui::dim(current),
+                ui::highlight(&latest)
+            ));
         } else {
             ui::progress("forcing reinstall");
         }
@@ -128,7 +132,9 @@ fn fetch_latest_version() -> Result<String, UpdateError> {
         }
     }
 
-    Err(UpdateError::Failed("could not parse version from GitHub response".to_string()))
+    Err(UpdateError::Failed(
+        "could not parse version from GitHub response".to_string(),
+    ))
 }
 
 fn run_install_script() -> Result<(), UpdateError> {
@@ -152,7 +158,11 @@ fn is_newer(latest: &str, current: &str) -> bool {
             .split('.')
             .filter_map(|s| s.parse().ok())
             .collect();
-        (*p.first().unwrap_or(&0), *p.get(1).unwrap_or(&0), *p.get(2).unwrap_or(&0))
+        (
+            *p.first().unwrap_or(&0),
+            *p.get(1).unwrap_or(&0),
+            *p.get(2).unwrap_or(&0),
+        )
     };
     parse(latest) > parse(current)
 }

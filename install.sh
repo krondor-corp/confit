@@ -5,8 +5,11 @@ REPO="krondor-corp/confit"
 BINARY="confit"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
+TMP=""
+trap 'rm -rf "${TMP}"' EXIT
+
 main() {
-    local os arch version url tmp
+    local os arch version url
 
     os="$(detect_os)"
     arch="$(detect_arch)"
@@ -16,12 +19,11 @@ main() {
 
     url="https://github.com/${REPO}/releases/download/${version}/${BINARY}-${version}-${arch}-${os}.tar.gz"
 
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "${tmp}"' EXIT
+    TMP="$(mktemp -d)"
 
-    curl -fsSL "${url}" | tar -xz -C "${tmp}"
+    curl -fsSL "${url}" | tar -xz -C "${TMP}"
     mkdir -p "${INSTALL_DIR}"
-    mv "${tmp}"/${BINARY}-${version}-${arch}-${os}/${BINARY} "${INSTALL_DIR}/${BINARY}"
+    mv "${TMP}"/${BINARY}-${version}-${arch}-${os}/${BINARY} "${INSTALL_DIR}/${BINARY}"
     chmod +x "${INSTALL_DIR}/${BINARY}"
 
     echo "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"

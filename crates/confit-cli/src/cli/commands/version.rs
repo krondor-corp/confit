@@ -14,7 +14,11 @@ impl Op for Version {
     type Error = Infallible;
 
     fn run(&self, _ctx: &Ctx) -> Result<Self::Output, Self::Error> {
-        eprintln!("{} {}", ui::bold("confit"), ui::highlight(env!("CARGO_PKG_VERSION")));
+        eprintln!(
+            "{} {}",
+            ui::bold("confit"),
+            ui::highlight(env!("CARGO_PKG_VERSION"))
+        );
         Ok(NoOutput)
     }
 }

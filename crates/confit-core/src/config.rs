@@ -472,7 +472,9 @@ pub fn resolve(
     let (value, is_leaf_secret) = if eval_providers {
         let value = eval_shells(&value, Some(&bc.config_dir))?;
         let leaf_secret = match &value {
-            Value::String(s) => resolve_provider(s, &bc.providers, &bc.merged_vars, Some(&bc.config_dir))?.1,
+            Value::String(s) => {
+                resolve_provider(s, &bc.providers, &bc.merged_vars, Some(&bc.config_dir))?.1
+            }
             _ => false,
         };
         let resolved = resolve_providers(

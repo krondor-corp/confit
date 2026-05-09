@@ -504,9 +504,7 @@ api_key = "abc"
 "#,
     );
     confit()
-        .args([
-            "run", "app", "--upper", "--", "sh", "-c", "echo $API_KEY",
-        ])
+        .args(["run", "app", "--upper", "--", "sh", "-c", "echo $API_KEY"])
         .current_dir(dir.path())
         .assert()
         .success()

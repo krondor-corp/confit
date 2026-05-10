@@ -15,11 +15,11 @@
   --primary-foreground: 40 20% 97%;
   --secondary: 40 10% 92%;
   --secondary-foreground: 30 10% 20%;
-  --accent: 40 10% 92%;
-  --accent-foreground: 30 10% 20%;
+  --accent: 38 92% 50%;
+  --accent-foreground: 38 90% 14%;
   --destructive: 0 60% 45%;
   --destructive-foreground: 0 0% 98%;
-  --ring: 30 8% 40%;
+  --ring: 38 92% 50%;
   --radius: 0.25rem;
 
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -43,11 +43,11 @@
     --primary-foreground: 30 8% 8%;
     --secondary: 30 5% 16%;
     --secondary-foreground: 35 12% 80%;
-    --accent: 30 5% 16%;
-    --accent-foreground: 35 12% 80%;
+    --accent: 38 80% 55%;
+    --accent-foreground: 38 90% 90%;
     --destructive: 0 50% 40%;
     --destructive-foreground: 0 0% 95%;
-    --ring: 30 5% 40%;
+    --ring: 38 80% 55%;
     color-scheme: dark;
   }
 }
@@ -67,11 +67,11 @@
   --primary-foreground: 30 8% 8%;
   --secondary: 30 5% 16%;
   --secondary-foreground: 35 12% 80%;
-  --accent: 30 5% 16%;
-  --accent-foreground: 35 12% 80%;
+  --accent: 38 80% 55%;
+  --accent-foreground: 38 90% 90%;
   --destructive: 0 50% 40%;
   --destructive-foreground: 0 0% 95%;
-  --ring: 30 5% 40%;
+  --ring: 38 80% 55%;
   color-scheme: dark;
 }
 
@@ -110,12 +110,13 @@ main {
 a {
   color: hsl(var(--foreground));
   text-decoration: underline;
-  text-decoration-color: hsl(var(--border));
+  text-decoration-color: hsl(var(--accent));
   text-underline-offset: 3px;
 }
 
 a:hover {
-  text-decoration-color: hsl(var(--foreground));
+  color: hsl(var(--accent));
+  text-decoration-color: hsl(var(--accent));
 }
 
 /* === Header === */
@@ -172,7 +173,7 @@ a:hover {
 }
 
 .site-nav-link:hover {
-  color: hsl(var(--foreground));
+  color: hsl(var(--accent));
   text-decoration: none;
 }
 
@@ -370,7 +371,7 @@ pre:hover .copy-btn {
 .highlight .kp, .highlight .kr, .highlight .kt { color: hsl(var(--foreground)); font-weight: 600; }
 .highlight .s, .highlight .s1, .highlight .s2,
 .highlight .sb, .highlight .sc, .highlight .sd,
-.highlight .sh, .highlight .sx { color: hsl(var(--muted-foreground)); }
+.highlight .sh, .highlight .sx { color: hsl(var(--accent)); }
 .highlight .c, .highlight .c1, .highlight .cm,
 .highlight .cp, .highlight .cs { color: hsl(var(--muted-foreground)); font-style: italic; }
 .highlight .nf, .highlight .nb { color: hsl(var(--foreground)); }
@@ -385,7 +386,7 @@ pre:hover .copy-btn {
 
 /* === Blockquotes === */
 blockquote {
-  border-left: 3px solid hsl(var(--border));
+  border-left: 3px solid hsl(var(--accent));
   padding: 0.35rem 1rem;
   margin: 1.25rem 0;
   color: hsl(var(--muted-foreground));
@@ -426,7 +427,7 @@ hr {
 
 /* === Selection === */
 ::selection {
-  background-color: hsl(var(--accent));
+  background-color: hsl(var(--accent) / 0.3);
   color: hsl(var(--foreground));
 }
 
@@ -510,13 +511,13 @@ hr {
 
 .sidebar-item a:hover {
   color: hsl(var(--foreground));
-  border-left-color: hsl(var(--border));
+  border-left-color: hsl(var(--accent));
   text-decoration: none;
 }
 
 .sidebar-item.active a {
   color: hsl(var(--foreground));
-  border-left-color: hsl(var(--foreground));
+  border-left-color: hsl(var(--accent));
   font-weight: 500;
 }
 
@@ -601,8 +602,8 @@ hr {
 .hero-cta {
   font-size: 0.875rem;
   font-weight: 500;
-  color: hsl(var(--primary-foreground));
-  background: hsl(var(--primary));
+  color: hsl(var(--accent-foreground));
+  background: hsl(var(--accent));
   padding: 0.45rem 1rem;
   border-radius: var(--radius);
   text-decoration: none;
@@ -611,6 +612,7 @@ hr {
 .hero-cta:hover {
   opacity: 0.9;
   text-decoration: none;
+  color: hsl(var(--accent-foreground));
 }
 
 .hero-link {

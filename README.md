@@ -3,6 +3,7 @@
 </p>
 
 # confit
+<!-- test: verify daemon spawn for confit -->
 
 [![CI](https://github.com/krondor-corp/confit/actions/workflows/test.yml/badge.svg)](https://github.com/krondor-corp/confit/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-violet.svg)](https://opensource.org/licenses/MIT)

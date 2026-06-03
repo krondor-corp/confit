@@ -430,7 +430,7 @@ fn is_source(scheme: &str, sources: &Value) -> bool {
     if scheme == "env" {
         return true;
     }
-    sources.as_table().map_or(false, |t| t.contains_key(scheme))
+    sources.as_table().is_some_and(|t| t.contains_key(scheme))
 }
 
 /// Resolve a single provider or source URI. Returns `(resolved_value, is_secret)`.
@@ -532,6 +532,7 @@ pub fn resolve_providers(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_providers_inner(
     node: &Value,
     providers: &Value,
@@ -795,6 +796,7 @@ pub fn validate(runtime_vars: &HashMap<String, String>) -> Result<Vec<(String, b
     let mut results = Vec::new();
     let mut source_cache = SourceCache::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         node: &Value,
         prefix: &str,

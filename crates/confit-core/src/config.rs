@@ -681,15 +681,17 @@ pub fn resolve(
     let (value, is_leaf_secret) = if eval_providers {
         let value = eval_shells(&value, Some(&bc.config_dir))?;
         let leaf_secret = match &value {
-            Value::String(s) => resolve_provider(
-                s,
-                &bc.providers,
-                &bc.sources,
-                &bc.merged_vars,
-                Some(&bc.config_dir),
-                &mut source_cache,
-            )?
-            .1,
+            Value::String(s) => {
+                resolve_provider(
+                    s,
+                    &bc.providers,
+                    &bc.sources,
+                    &bc.merged_vars,
+                    Some(&bc.config_dir),
+                    &mut source_cache,
+                )?
+                .1
+            }
             _ => false,
         };
         let resolved = resolve_providers(
@@ -1629,18 +1631,14 @@ mod tests {
     fn test_source_cached_single_load() {
         // The source outputs a random suffix each call; caching means we get the same value twice
         let mut sources_map = Map::new();
-        sources_map.insert(
-            "mysrc".into(),
-            Value::String("echo FOO=$(date +%N)".into()),
-        );
+        sources_map.insert("mysrc".into(), Value::String("echo FOO=$(date +%N)".into()));
         let sources = Value::Table(sources_map);
 
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
-        let first = resolve_from_source("mysrc", "FOO", &sources, &vars, None, &mut cache)
-            .unwrap();
-        let second = resolve_from_source("mysrc", "FOO", &sources, &vars, None, &mut cache)
-            .unwrap();
+        let first = resolve_from_source("mysrc", "FOO", &sources, &vars, None, &mut cache).unwrap();
+        let second =
+            resolve_from_source("mysrc", "FOO", &sources, &vars, None, &mut cache).unwrap();
         assert_eq!(first, second, "second call should return cached value");
     }
 
@@ -1653,15 +1651,8 @@ mod tests {
         let providers = Value::Table(Map::new());
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
-        let (val, secret) = resolve_provider(
-            "myenv://KEY",
-            &providers,
-            &sources,
-            &vars,
-            None,
-            &mut cache,
-        )
-        .unwrap();
+        let (val, secret) =
+            resolve_provider("myenv://KEY", &providers, &sources, &vars, None, &mut cache).unwrap();
         assert_eq!(val, "resolved");
         assert!(!secret);
     }
@@ -1688,7 +1679,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(val, "hunter2");
-        assert!(secret, "source with secret=true should mark field as secret");
+        assert!(
+            secret,
+            "source with secret=true should mark field as secret"
+        );
     }
 
     #[test]
@@ -1775,10 +1769,7 @@ mod tests {
     #[test]
     fn test_source_rejects_path_in_template() {
         let mut sources_map = Map::new();
-        sources_map.insert(
-            "bad".into(),
-            Value::String("echo {path}=value".into()),
-        );
+        sources_map.insert("bad".into(), Value::String("echo {path}=value".into()));
         let sources = Value::Table(sources_map);
 
         let vars = HashMap::new();

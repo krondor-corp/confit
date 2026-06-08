@@ -728,3 +728,206 @@ endpoint = "{vars.region}"
         .success()
         .stdout("from-cli");
 }
+
+// --- sources ---
+
+#[test]
+fn source_string_shorthand_resolves_field() {
+    let dir = setup(
+        r#"
+[sources]
+bag = "printf 'FOO=hello\nBAR=world\n'"
+
+[app]
+foo = "bag://FOO"
+bar = "bag://BAR"
+"#,
+    );
+    confit()
+        .args(["resolve", "app.foo"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout("hello");
+    confit()
+        .args(["resolve", "app.bar"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout("world");
+}
+
+#[test]
+fn source_table_form_resolves_field() {
+    let dir = setup(
+        r#"
+[sources.vault]
+load = "printf 'TOKEN=abc123\n'"
+
+[app]
+token = "vault://TOKEN"
+"#,
+    );
+    confit()
+        .args(["resolve", "app.token"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout("abc123");
+}
+
+#[test]
+fn source_secret_flag_masks_output() {
+    let dir = setup(
+        r#"
+[sources.vault]
+load   = "printf 'PASS=hunter2\n'"
+secret = true
+
+[creds]
+password = "vault://PASS"
+"#,
+    );
+    confit()
+        .args(["show", "creds"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("password=***"));
+}
+
+#[test]
+fn source_secret_flag_revealed() {
+    let dir = setup(
+        r#"
+[sources.vault]
+load   = "printf 'PASS=hunter2\n'"
+secret = true
+
+[creds]
+password = "vault://PASS"
+"#,
+    );
+    confit()
+        .args(["show", "creds", "--reveal"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("password=hunter2"));
+}
+
+#[test]
+fn source_secret_prefix_composes() {
+    let dir = setup(
+        r#"
+[sources]
+plain = "printf 'TOKEN=abc123\n'"
+
+[creds]
+token = "secret://plain://TOKEN"
+"#,
+    );
+    confit()
+        .args(["show", "creds"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("token=***"));
+}
+
+#[test]
+fn source_missing_field_errors() {
+    let dir = setup(
+        r#"
+[sources]
+bag = "printf 'FOO=hello\n'"
+
+[app]
+val = "bag://NOPE"
+"#,
+    );
+    confit()
+        .args(["resolve", "app.val"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("NOPE"));
+}
+
+#[test]
+fn source_vars_interpolation() {
+    let dir = setup(
+        r#"
+[vars]
+stage = "prod"
+
+[sources]
+mysrc = "printf 'STAGE={vars.stage}\n'"
+
+[app]
+val = "mysrc://STAGE"
+"#,
+    );
+    confit()
+        .args(["resolve", "app.val"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout("prod");
+}
+
+#[test]
+fn env_source_builtin() {
+    let dir = setup(
+        r#"
+[app]
+path = "env://PATH"
+"#,
+    );
+    confit()
+        .args(["resolve", "app.path"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn env_source_missing_var_errors() {
+    let dir = setup(
+        r#"
+[app]
+val = "env://DEFINITELY_NOT_SET_CONFIT_XYZ_123"
+"#,
+    );
+    confit()
+        .args(["resolve", "app.val"])
+        .env_remove("DEFINITELY_NOT_SET_CONFIT_XYZ_123")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "DEFINITELY_NOT_SET_CONFIT_XYZ_123",
+        ));
+}
+
+#[test]
+fn source_show_multiple_keys() {
+    let dir = setup(
+        r#"
+[sources]
+bag = "printf 'A=alpha\nB=beta\n'"
+
+[app]
+a = "bag://A"
+b = "bag://B"
+"#,
+    );
+    let out = confit()
+        .args(["show", "app"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("a=alpha"));
+    assert!(stdout.contains("b=beta"));
+}

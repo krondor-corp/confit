@@ -1,7 +1,7 @@
 ---
 title: Variables
 slug: variables
-order: 7
+order: 8
 ---
 
 ## what variables are

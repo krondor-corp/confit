@@ -9,6 +9,7 @@
     - interpolation
     - shell-eval
     - providers
+    - sources
     - variables
 
 - title: Practical

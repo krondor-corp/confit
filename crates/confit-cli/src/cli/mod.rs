@@ -5,7 +5,7 @@ pub mod ui;
 
 use clap::Parser;
 
-use commands::{init, keys, log, resolve, run, show, ssh, update, validate, version};
+use commands::{export, init, keys, log, resolve, run, show, ssh, update, validate, version};
 use op::command_enum;
 
 #[derive(Parser)]
@@ -32,6 +32,8 @@ command_enum! {
         Resolve(resolve::Resolve),
         /// Display a config section as KEY=VALUE or YAML
         Show(show::Show),
+        /// Materialize a profile or sections into a dotenv/shell/json env
+        Export(export::Export),
         /// List key names under a config section
         Keys(keys::Keys),
         /// Run a command with a config section injected as env vars

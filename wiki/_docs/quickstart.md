@@ -73,6 +73,23 @@ export BASE_URL=https://example.com
 export NODE_ENV=production
 ```
 
+## materialize an env file
+
+For a persistent env you can source from any fresh shell — handy for coding
+agents that run each command in a new process — use [`confit export`](/docs/commands/#export):
+
+```bash
+# write a gitignored dotenv file (one unlock, real values, mode 0600)
+$ confit export services.web.env --reveal --out .env.local
+✓ wrote 3 vars to .env.local (API_KEY, BASE_URL, NODE_ENV)
+
+# thereafter, in any shell — no re-auth
+$ set -a; . .env.local; set +a
+```
+
+Compose several sections into one file by listing them (later wins), or declare
+the composition once as an [env profile](/docs/profiles/) and export `--profile`.
+
 ## run a command with injected env
 
 ```bash

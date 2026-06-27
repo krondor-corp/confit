@@ -931,3 +931,279 @@ b = "bag://B"
     assert!(stdout.contains("a=alpha"));
     assert!(stdout.contains("b=beta"));
 }
+
+// --- export ---
+
+fn git_init(dir: &std::path::Path) {
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(dir)
+        .output()
+        .unwrap();
+}
+
+#[test]
+fn export_profile_dotenv() {
+    let dir = setup(
+        r#"
+[credentials.app]
+service_secret = "shh"
+[accessories.postgres]
+url = "postgres://localhost/db"
+[env.dev]
+SERVICE_SECRET = "{credentials.app.service_secret}"
+POSTGRES_URL = "{accessories.postgres.url}"
+HOST_NAME = "http://localhost:8000"
+"#,
+    );
+    let out = confit()
+        .args(["export", "--profile", "dev"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("SERVICE_SECRET='shh'"), "got: {stdout}");
+    assert!(stdout.contains("POSTGRES_URL='postgres://localhost/db'"));
+    assert!(stdout.contains("HOST_NAME='http://localhost:8000'"));
+}
+
+#[test]
+fn export_multi_section_later_wins() {
+    let dir = setup(
+        r#"
+[base]
+HOST = "base-host"
+PORT = "1"
+[override]
+HOST = "override-host"
+"#,
+    );
+    let out = confit()
+        .args(["export", "base", "override"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("HOST='override-host'"), "got: {stdout}");
+    assert!(stdout.contains("PORT='1'"));
+    assert!(!stdout.contains("base-host"));
+}
+
+#[test]
+fn export_shell_format() {
+    let dir = setup("[app]\nfoo = \"bar\"\n");
+    confit()
+        .args(["export", "app", "--format", "shell"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("export foo='bar'"));
+}
+
+#[test]
+fn export_json_format() {
+    let dir = setup("[app]\nhost = \"localhost\"\n");
+    confit()
+        .args(["export", "app", "--format", "json"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"host\": \"localhost\""));
+}
+
+#[test]
+fn export_quotes_embedded_single_quote() {
+    let dir = setup("[app]\nmsg = \"it's fine\"\n");
+    confit()
+        .args(["export", "app"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("msg='it'\\''s fine'"));
+}
+
+#[test]
+fn export_upper_and_prefix() {
+    let dir = setup("[app]\nkey = \"v\"\n");
+    confit()
+        .args(["export", "app", "--upper", "--prefix", "app_"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("APP_KEY='v'"));
+}
+
+#[test]
+fn export_refuses_secret_without_reveal() {
+    let dir = setup("[creds]\ntoken = \"secret://hunter2\"\n");
+    confit()
+        .args(["export", "creds"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--reveal"));
+}
+
+#[test]
+fn export_reveals_secret_with_flag() {
+    let dir = setup("[creds]\ntoken = \"secret://hunter2\"\n");
+    confit()
+        .args(["export", "creds", "--reveal"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("token='hunter2'"));
+}
+
+#[test]
+fn export_no_source_errors() {
+    let dir = setup("[app]\nx = \"1\"\n");
+    confit()
+        .arg("export")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nothing to export"));
+}
+
+#[test]
+fn export_out_refuses_non_gitignored() {
+    let dir = setup("[app]\nx = \"1\"\n");
+    git_init(dir.path());
+    confit()
+        .args(["export", "app", "--out", ".env.dev"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("not gitignored").or(predicate::str::contains("gitignore")),
+        );
+    assert!(!dir.path().join(".env.dev").exists());
+}
+
+#[test]
+fn export_out_writes_gitignored_file() {
+    let dir = setup("[app]\nhost = \"localhost\"\n");
+    git_init(dir.path());
+    fs::write(dir.path().join(".gitignore"), ".env.dev\n").unwrap();
+    let out = confit()
+        .args(["export", "app", "--out", ".env.dev"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(out.get_output().stdout.is_empty());
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("wrote 1 vars"), "got: {stderr}");
+    let path = dir.path().join(".env.dev");
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("host='localhost'"));
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+}
+
+#[test]
+fn export_out_force_overrides_guard() {
+    let dir = setup("[app]\nhost = \"localhost\"\n");
+    git_init(dir.path());
+    confit()
+        .args(["export", "app", "--out", ".env.dev", "--force"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join(".env.dev").exists());
+}
+
+#[test]
+fn export_out_warns_outside_git_repo() {
+    let dir = setup("[app]\nhost = \"localhost\"\n");
+    confit()
+        .args(["export", "app", "--out", ".env.dev"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("could not confirm"));
+    assert!(dir.path().join(".env.dev").exists());
+}
+
+#[test]
+fn export_out_secret_requires_reveal() {
+    let dir = setup("[creds]\ntoken = \"secret://hunter2\"\n");
+    fs::write(dir.path().join(".gitignore"), ".env.dev\n").unwrap();
+    confit()
+        .args(["export", "creds", "--out", ".env.dev"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--reveal"));
+    assert!(!dir.path().join(".env.dev").exists());
+}
+
+#[test]
+fn export_profile_pins_vars() {
+    // The profile pins stage=development via dotted `vars.stage`; the provider
+    // template uses {stage}, so it must resolve without --set on the CLI.
+    let dir = setup(
+        r#"
+[providers.echo]
+cmd = "printf %s {stage}-{path}"
+[secrets]
+token = "echo://abc"
+[env.dev]
+vars.stage = "development"
+TOKEN = "{secrets.token}"
+"#,
+    );
+    confit()
+        .args(["export", "--profile", "dev"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("TOKEN='development-abc'"));
+}
+
+#[test]
+fn export_profile_vars_overridden_by_set() {
+    // Sub-table form ([env.dev.vars]) is equivalent to dotted keys; covered here.
+    let dir = setup(
+        r#"
+[providers.echo]
+cmd = "printf %s {stage}"
+[secrets]
+token = "echo://x"
+[env.dev]
+STAGE = "{secrets.token}"
+[env.dev.vars]
+stage = "development"
+"#,
+    );
+    confit()
+        .args(["--set", "stage=staging", "export", "--profile", "dev"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("STAGE='staging'"));
+}
+
+#[test]
+fn export_profile_from_source() {
+    // A profile composes fields from a [sources] bulk loader (loads once).
+    let dir = setup(
+        r#"
+[sources]
+bag = "printf 'DB=postgres://x\nAPI=k3y\n'"
+[env.dev]
+DATABASE_URL = "bag://DB"
+API_KEY = "bag://API"
+"#,
+    );
+    confit()
+        .args(["export", "--profile", "dev"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("DATABASE_URL='postgres://x'")
+                .and(predicate::str::contains("API_KEY='k3y'")),
+        );
+}

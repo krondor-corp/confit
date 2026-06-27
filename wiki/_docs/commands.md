@@ -93,6 +93,80 @@ credentials_cloud:
 
 When `--upper` is set, confit detects key collisions (e.g. `api_key` and `API_KEY` both becoming `API_KEY`) and errors instead of silently shadowing.
 
+## export
+
+Materialize a complete env from a named profile or one or more sections — into a
+file you can source repeatedly (no re-auth) or into stdout for `eval`.
+
+```
+confit export [--profile <name> | <section>...] [OPTIONS]
+```
+
+| Option | Description |
+|--------|------------|
+| `--profile <name>` | Export the `[env.<name>]` profile (see [Env profiles](/docs/profiles/)) |
+| `-o, --out <file>` | Write a dotenv file (mode `0600`, atomic) instead of stdout |
+| `--format <fmt>` | `dotenv` (default), `shell`, or `json` |
+| `--reveal` | Required to emit real secret values (refuses otherwise) |
+| `--upper` | Uppercase key names |
+| `--prefix <p>` | Prepend a prefix to every key name |
+| `--no-eval` | Skip provider and shell evaluation |
+| `--force` | Write even if the target file is not gitignored |
+
+Where `show` takes a single section and masks secrets by default, `export` is
+purpose-built for materializing a **working env** safely:
+
+- **Multiple sources.** Pass several `<section>`s (later wins on key conflicts)
+  or a single `--profile`, so a complete dev env can be composed from
+  `credentials.app`, a [`[sources]`](/docs/sources/) bag, [providers](/docs/providers/),
+  and literals. A single source bag is loaded once even when many keys reference it.
+- **`--reveal` is mandatory for secrets.** A file meant to be sourced must hold
+  real values, so `export` refuses (rather than writing masked `***` junk) if any
+  value is secret and `--reveal` is not set.
+- **Safe file output.** `--out` writes with mode `0600`, **atomically** (temp +
+  rename), and refuses paths that aren't gitignored (checked via
+  `git check-ignore`) unless you pass `--force`. Outside a git repo it warns and
+  proceeds.
+- **No secrets in your transcript.** With `--out`, secret values go only to the
+  file — stdout stays empty and a keys-only summary is printed to stderr.
+- **Fails closed.** If any referenced value can't resolve, `export` exits nonzero
+  and writes nothing, so a half-written env is never sourced.
+
+**Formats:**
+
+```bash
+# dotenv (default) — KEY='value', source with `set -a`
+$ confit export --profile dev --reveal
+SERVICE_SECRET='sk-live-...'
+POSTGRES_URL='postgres://localhost:5432/app'
+HOST_NAME='http://localhost:8000'
+
+# shell — export KEY='value', for eval
+$ eval "$(confit export --profile dev --reveal --format shell)"
+
+# json — a JSON object of key/value pairs
+$ confit export --profile dev --reveal --format json
+{
+  "SERVICE_SECRET": "sk-live-...",
+  "POSTGRES_URL": "postgres://localhost:5432/app"
+}
+```
+
+**Agent / dev workflow** — one 1Password unlock, then reuse from any fresh shell:
+
+```bash
+# once — the human approves the single 1Password unlock
+$ confit --set stage=development export --profile dev --reveal --out web/py/.env.dev
+✓ wrote 7 vars to web/py/.env.dev (SERVICE_SECRET, POSTGRES_URL, REDIS_URL, ...)
+
+# thereafter — any process, any fresh shell, no re-auth
+$ set -a; . web/py/.env.dev; set +a
+$ uv run alembic upgrade head
+```
+
+The materialized file is a short-lived secrets artifact: keep it gitignored and
+delete it when you're done (e.g. `git clean -fdx` or a `make dev-clean`).
+
 ## keys
 
 List the key names under a config section.

@@ -11,6 +11,7 @@
     - providers
     - sources
     - variables
+    - profiles
 
 - title: Practical
   items:

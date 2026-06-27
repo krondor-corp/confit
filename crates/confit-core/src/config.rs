@@ -609,6 +609,19 @@ pub fn build_config(
     path: Option<&Path>,
     runtime_vars: &HashMap<String, String>,
 ) -> Result<BuiltConfig> {
+    build_config_layered(path, &HashMap::new(), runtime_vars)
+}
+
+/// Like [`build_config`], but layers an additional set of variable defaults
+/// (e.g. vars pinned by an env profile) between the `[vars]` section and the
+/// ambient `CONFIT_VAR_*` / `--set` overrides.
+///
+/// Precedence, lowest to highest: `[vars]` < `profile_vars` < `CONFIT_VAR_*` < runtime.
+pub fn build_config_layered(
+    path: Option<&Path>,
+    profile_vars: &HashMap<String, String>,
+    runtime_vars: &HashMap<String, String>,
+) -> Result<BuiltConfig> {
     let path = match path {
         Some(p) => p.to_path_buf(),
         None => find_config()?,
@@ -637,6 +650,7 @@ pub fn build_config(
 
     let env_vars = collect_env_vars();
     let mut merged_vars = vars_section;
+    merged_vars.extend(profile_vars.clone());
     merged_vars.extend(env_vars);
     merged_vars.extend(runtime_vars.clone());
 
@@ -745,12 +759,15 @@ pub struct EnvPair {
     pub secret: bool,
 }
 
-pub fn env(
+/// Resolve a single section's leaf keys into env pairs against an already-built
+/// config, sharing a [`SourceCache`] so bulk sources load at most once across
+/// multiple sections.
+fn env_from_built(
+    bc: &BuiltConfig,
     dotted_path: &str,
     eval_providers: bool,
-    runtime_vars: &HashMap<String, String>,
+    source_cache: &mut SourceCache,
 ) -> Result<Vec<EnvPair>> {
-    let bc = build_config(None, runtime_vars)?;
     let node = get(&bc.config, dotted_path)?;
     let interpolated = interpolate_node(node, &bc.config)?;
     let table = match interpolated.as_table() {
@@ -765,7 +782,6 @@ pub fn env(
     }
     let leaves = Value::Table(leaves);
     let mut secrets = HashSet::new();
-    let mut source_cache = SourceCache::new();
     let resolved = if eval_providers {
         let leaves = eval_shells(&leaves, Some(&bc.config_dir))?;
         resolve_providers(
@@ -775,7 +791,7 @@ pub fn env(
             &bc.merged_vars,
             Some(&bc.config_dir),
             &mut secrets,
-            &mut source_cache,
+            source_cache,
         )?
     } else {
         leaves
@@ -789,6 +805,73 @@ pub fn env(
             secret: secrets.contains(k.as_str()),
         })
         .collect())
+}
+
+pub fn env(
+    dotted_path: &str,
+    eval_providers: bool,
+    runtime_vars: &HashMap<String, String>,
+) -> Result<Vec<EnvPair>> {
+    let bc = build_config(None, runtime_vars)?;
+    let mut source_cache = SourceCache::new();
+    env_from_built(&bc, dotted_path, eval_providers, &mut source_cache)
+}
+
+/// Resolve one or more sections into a single ordered set of env pairs.
+///
+/// Sections are composed left-to-right; on a key conflict the later section
+/// wins (its value replaces the earlier one, keeping the original position).
+pub fn env_multi(
+    dotted_paths: &[String],
+    eval_providers: bool,
+    runtime_vars: &HashMap<String, String>,
+) -> Result<Vec<EnvPair>> {
+    env_multi_with_vars(dotted_paths, &HashMap::new(), eval_providers, runtime_vars)
+}
+
+/// Like [`env_multi`], but layers `profile_vars` into resolution (see
+/// [`build_config_layered`] for precedence). Used so an env profile can pin its
+/// own vars (e.g. `stage`) without requiring `--set` at the call site.
+///
+/// A single [`SourceCache`] is shared across every section, so a `[sources]`
+/// bag referenced from multiple sections is loaded only once.
+pub fn env_multi_with_vars(
+    dotted_paths: &[String],
+    profile_vars: &HashMap<String, String>,
+    eval_providers: bool,
+    runtime_vars: &HashMap<String, String>,
+) -> Result<Vec<EnvPair>> {
+    let bc = build_config_layered(None, profile_vars, runtime_vars)?;
+    let mut source_cache = SourceCache::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: HashMap<String, EnvPair> = HashMap::new();
+    for path in dotted_paths {
+        for pair in env_from_built(&bc, path, eval_providers, &mut source_cache)? {
+            if !by_key.contains_key(&pair.key) {
+                order.push(pair.key.clone());
+            }
+            by_key.insert(pair.key.clone(), pair);
+        }
+    }
+    Ok(order
+        .into_iter()
+        .map(|k| by_key.remove(&k).unwrap())
+        .collect())
+}
+
+/// Read the literal `vars` sub-table of a profile section (e.g. `env.dev.vars`),
+/// returning an empty map if the profile or its `vars` table is absent.
+pub fn read_profile_vars(profile_path: &str) -> Result<HashMap<String, String>> {
+    let path = find_config()?;
+    let raw = load_raw(&path)?;
+    let vars_path = format!("{profile_path}.vars");
+    match get(&raw, &vars_path) {
+        Ok(Value::Table(t)) => Ok(t
+            .iter()
+            .map(|(k, v)| (k.clone(), value_to_string(v)))
+            .collect()),
+        _ => Ok(HashMap::new()),
+    }
 }
 
 pub fn validate(runtime_vars: &HashMap<String, String>) -> Result<Vec<(String, bool, String)>> {

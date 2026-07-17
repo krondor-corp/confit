@@ -33,7 +33,12 @@ impl Op for Validate {
     type Error = ValidateError;
 
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
-        let mut results = confit_core::config::validate(ctx.vars())?;
+        let bc = confit_core::config::build_config(None, ctx.vars())?;
+        let mut results = confit_core::config::validate_built(&bc);
+        let section_in_scope = |section: &str| match &self.section {
+            None => true,
+            Some(s) => s == section || s.starts_with(&format!("{section}.")),
+        };
         if let Some(ref s) = self.section {
             let prefix = format!("{s}.");
             results.retain(|(p, _, _)| p == s || p.starts_with(&prefix));
@@ -52,12 +57,7 @@ impl Op for Validate {
         // host's ephemeral range, service ports already bound, and ledger
         // corruption. Read-only and cheap, so there's no reason to gate it
         // behind a flag.
-        let ports_in_scope = match &self.section {
-            None => true,
-            Some(s) => s == "ports" || s.starts_with("ports."),
-        };
-        if ports_in_scope {
-            let bc = confit_core::config::build_config(None, ctx.vars())?;
+        if section_in_scope("ports") {
             if let Ok(ports) = confit_core::config::get(&bc.config, "ports") {
                 let issues = confit_core::ports::check_host(ports, &bc.config_dir)?;
                 for issue in &issues {

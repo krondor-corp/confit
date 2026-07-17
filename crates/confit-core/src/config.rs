@@ -882,6 +882,14 @@ pub fn read_profile_vars(profile_path: &str) -> Result<HashMap<String, String>> 
 
 pub fn validate(runtime_vars: &HashMap<String, String>) -> Result<Vec<(String, bool, String)>> {
     let bc = build_config(None, runtime_vars)?;
+    Ok(validate_built(&bc))
+}
+
+/// Like [`validate`], but against an already-[`build_config`]'d config --
+/// for callers that need the [`BuiltConfig`] for something else too (e.g.
+/// checking a `[ports]` section against the host) and shouldn't parse
+/// confit.toml a second time to get it.
+pub fn validate_built(bc: &BuiltConfig) -> Vec<(String, bool, String)> {
     let mut results = Vec::new();
     let mut source_cache = SourceCache::new();
 
@@ -970,7 +978,7 @@ pub fn validate(runtime_vars: &HashMap<String, String>) -> Result<Vec<(String, b
         &mut results,
         &mut source_cache,
     );
-    Ok(results)
+    results
 }
 
 pub fn yaml_section(

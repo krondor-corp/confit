@@ -10,12 +10,6 @@ use crate::cli::ui;
 pub struct Validate {
     /// Limit validation to a specific section
     pub section: Option<String>,
-    /// Also check the [ports] section against this host: within-file
-    /// collisions, privileged/out-of-range ports, ports inside the host's
-    /// ephemeral range, service ports already bound, and other checked-out
-    /// worktrees whose branch hashes to the same slot
-    #[arg(long)]
-    pub host: bool,
 }
 
 pub struct ValidateOutput;
@@ -53,7 +47,16 @@ impl Op for Validate {
                 failures += 1;
             }
         }
-        if self.host {
+        // Whenever [ports] is in scope, also check it against this host:
+        // collisions, privileged/out-of-range ports, ports inside the
+        // host's ephemeral range, service ports already bound, and ledger
+        // corruption. Read-only and cheap, so there's no reason to gate it
+        // behind a flag.
+        let ports_in_scope = match &self.section {
+            None => true,
+            Some(s) => s == "ports" || s.starts_with("ports."),
+        };
+        if ports_in_scope {
             let bc = confit_core::config::build_config(None, ctx.vars())?;
             if let Ok(ports) = confit_core::config::get(&bc.config, "ports") {
                 let issues = confit_core::ports::check_host(ports, &bc.config_dir)?;

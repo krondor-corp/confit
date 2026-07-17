@@ -122,16 +122,17 @@ offsets; `ports.services.*` values must be integer lanes.
 
 ## Checking a band against this host
 
-`confit validate --host` additionally checks the resolved `[ports]` values
-against the machine you're running on: two names resolving to the same
-port, privileged (`<1024`) ports, ports inside this host's OS-assigned
+Whenever a `[ports]` section is in scope, `confit validate` (and
+`confit validate ports`) also checks the resolved values against the
+machine you're running on -- no flag needed: two names resolving to the
+same port, privileged (`<1024`) ports, ports inside this host's OS-assigned
 ephemeral range (which risks the OS handing one out for an unrelated
 outbound connection), service ports another process already has bound, and
 ledger corruption (two branches recorded against the same slot, which
 `expand_ports` itself can't produce but a hand-edited `ports.toml` could):
 
 ```bash
-$ confit validate --host
+$ confit validate
 ✓ ports.band
 ✓ ports.branch
 ...

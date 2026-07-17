@@ -10,6 +10,12 @@ use crate::cli::ui;
 pub struct Validate {
     /// Limit validation to a specific section
     pub section: Option<String>,
+    /// Also check the [ports] section against this host: within-file
+    /// collisions, privileged/out-of-range ports, ports inside the host's
+    /// ephemeral range, service ports already bound, and other checked-out
+    /// worktrees whose branch hashes to the same slot
+    #[arg(long)]
+    pub host: bool,
 }
 
 pub struct ValidateOutput;
@@ -47,6 +53,26 @@ impl Op for Validate {
                 failures += 1;
             }
         }
+        if self.host {
+            let bc = confit_core::config::build_config(None, ctx.vars())?;
+            if let Ok(ports) = confit_core::config::get(&bc.config, "ports") {
+                let issues = confit_core::ports::check_host(ports, &bc.config_dir)?;
+                for issue in &issues {
+                    let line = format!("ports.{}: {}", issue.path, issue.message);
+                    match issue.severity {
+                        confit_core::ports::Severity::Error => {
+                            ui::failure(&line);
+                            failures += 1;
+                        }
+                        confit_core::ports::Severity::Warning => ui::warning(&line),
+                    }
+                }
+                if issues.is_empty() {
+                    ui::success("ports: no issues found on this host");
+                }
+            }
+        }
+
         if failures > 0 {
             return Err(ValidateError::Failures(failures));
         }

@@ -666,6 +666,12 @@ pub fn build_config_layered(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
+    if let Some(ports) = table.get("ports") {
+        let branch = crate::ports::current_branch(&config_dir)?;
+        let expanded = crate::ports::expand_ports(ports, &branch, &config_dir)?;
+        table.insert("ports".into(), expanded);
+    }
+
     Ok(BuiltConfig {
         config: raw,
         providers,
@@ -1514,6 +1520,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, "hunter2");
+    }
+
+    #[test]
+    fn test_end_to_end_with_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let path = write_config(
+            dir.path(),
+            r#"
+            [ports]
+            band = 4300
+
+            [ports.infra]
+            postgres = 0
+
+            [ports.services]
+            app = 50
+
+            [db]
+            url = "postgres://localhost:{ports.infra.postgres}/mydb"
+            "#,
+        );
+        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
+
+        // main/master is unborn HEAD's symbolic ref by default in a fresh
+        // `git init`, so slot should be 0 and app == band + lane.
+        let branch = get(&bc.config, "ports.branch").unwrap().as_str().unwrap();
+        let slot = get(&bc.config, "ports.slot").unwrap().as_integer().unwrap();
+        assert_eq!(
+            get(&bc.config, "ports.infra.postgres")
+                .unwrap()
+                .as_integer()
+                .unwrap(),
+            4300
+        );
+        assert_eq!(
+            get(&bc.config, "ports.services.app")
+                .unwrap()
+                .as_integer()
+                .unwrap(),
+            4300 + 50 + slot
+        );
+        assert_eq!(
+            get(&bc.config, "ports.branch_slug")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            crate::ports::slugify(branch)
+        );
+
+        // ports.* values are ordinary refs, resolvable from elsewhere in the file.
+        let node = get(&bc.config, "db.url").unwrap();
+        let interpolated = interpolate_node(node, &bc.config).unwrap();
+        assert_eq!(
+            interpolated.as_str().unwrap(),
+            "postgres://localhost:4300/mydb"
+        );
     }
 
     #[test]

@@ -24,16 +24,47 @@
 //! `ports.services.app = 4353`, etc. — ordinary values, resolved through the
 //! same `{ref}` pipeline as everything else in confit.toml.
 
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::Path;
 
-use toml::map::Map;
+use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::error::{Error, Result};
 use crate::git::Git;
 
 const DEFAULT_PRIMARY_BRANCHES: &[&str] = &["main", "master"];
+
+/// The declared shape of a `[ports]` table, before expansion. Deserialized
+/// directly from the raw `toml::Value` -- no manual `.get()`/`.as_*()`
+/// field-by-field poking.
+#[derive(Debug, Deserialize)]
+struct PortsSpec {
+    band: i64,
+    #[serde(default)]
+    primary_branches: Vec<String>,
+    #[serde(default)]
+    infra: BTreeMap<String, i64>,
+    #[serde(default)]
+    services: BTreeMap<String, i64>,
+}
+
+/// The shape of a `[ports]` table after [`expand_ports`]: what confit.toml's
+/// `{ports.*}` refs resolve against, and what [`check_host`] reads back.
+/// `infra`/`services` here hold fully-resolved ports, not offsets/lanes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolvedPorts {
+    band: i64,
+    branch: String,
+    branch_slug: String,
+    slot: u8,
+    primary_branches: Vec<String>,
+    #[serde(default)]
+    infra: BTreeMap<String, i64>,
+    #[serde(default)]
+    services: BTreeMap<String, i64>,
+}
 
 /// The current branch name, via [`Git::current_branch`].
 pub fn current_branch(cwd: &Path) -> Result<String> {
@@ -66,79 +97,51 @@ fn is_primary_branch(branch: &str, primary_branches: &[String]) -> bool {
     }
 }
 
-/// Expand a `[ports]` table in place: resolves `infra.*` to `band + offset`,
+/// Expand a `[ports]` table: resolves `infra.*` to `band + offset`,
 /// `services.*` to `band + lane + slot`, and adds `branch`, `branch_slug`,
 /// `slot` as plain values alongside `band`. `slot` comes from the ledger in
 /// [`crate::slots`], which requires `cwd` to be inside a git working tree.
 pub fn expand_ports(ports: &Value, branch: &str, cwd: &Path) -> Result<Value> {
-    let ports_table = ports
-        .as_table()
-        .ok_or_else(|| Error::Runtime("[ports] must be a table".into()))?;
-
-    let band = ports_table
-        .get("band")
-        .and_then(|v| v.as_integer())
-        .ok_or_else(|| Error::Runtime("[ports] section requires an integer 'band'".into()))?;
-
-    let primary_branches: Vec<String> = ports_table
-        .get("primary_branches")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let spec: PortsSpec = ports
+        .clone()
+        .try_into()
+        .map_err(|e| Error::Runtime(format!("[ports]: {e}")))?;
 
     let slug = slugify(branch);
-    let slot = if is_primary_branch(branch, &primary_branches) {
+    let slot = if is_primary_branch(branch, &spec.primary_branches) {
         0
     } else {
         crate::slots::assign(&Git::new(cwd), branch)?
     };
 
-    let effective_primary: Vec<String> = if primary_branches.is_empty() {
+    let primary_branches = if spec.primary_branches.is_empty() {
         DEFAULT_PRIMARY_BRANCHES
             .iter()
             .map(|s| s.to_string())
             .collect()
     } else {
-        primary_branches
+        spec.primary_branches
     };
 
-    let mut out = Map::new();
-    out.insert("band".into(), Value::Integer(band));
-    out.insert("branch".into(), Value::String(branch.to_string()));
-    out.insert("branch_slug".into(), Value::String(slug));
-    out.insert("slot".into(), Value::Integer(slot as i64));
-    out.insert(
-        "primary_branches".into(),
-        Value::Array(effective_primary.into_iter().map(Value::String).collect()),
-    );
+    let resolved = ResolvedPorts {
+        band: spec.band,
+        branch: branch.to_string(),
+        branch_slug: slug,
+        slot,
+        primary_branches,
+        infra: spec
+            .infra
+            .into_iter()
+            .map(|(name, offset)| (name, spec.band + offset))
+            .collect(),
+        services: spec
+            .services
+            .into_iter()
+            .map(|(name, lane)| (name, spec.band + lane + slot as i64))
+            .collect(),
+    };
 
-    if let Some(infra) = ports_table.get("infra").and_then(|v| v.as_table()) {
-        let mut resolved = Map::new();
-        for (name, v) in infra {
-            let offset = v.as_integer().ok_or_else(|| {
-                Error::Runtime(format!("[ports.infra.{name}] must be an integer offset"))
-            })?;
-            resolved.insert(name.clone(), Value::Integer(band + offset));
-        }
-        out.insert("infra".into(), Value::Table(resolved));
-    }
-
-    if let Some(services) = ports_table.get("services").and_then(|v| v.as_table()) {
-        let mut resolved = Map::new();
-        for (name, v) in services {
-            let lane = v.as_integer().ok_or_else(|| {
-                Error::Runtime(format!("[ports.services.{name}] must be an integer lane"))
-            })?;
-            resolved.insert(name.clone(), Value::Integer(band + lane + slot as i64));
-        }
-        out.insert("services".into(), Value::Table(resolved));
-    }
-
-    Ok(Value::Table(out))
+    Value::try_from(&resolved).map_err(|e| Error::Runtime(format!("[ports]: {e}")))
 }
 
 /// How serious a [`HostIssue`] is.
@@ -195,26 +198,21 @@ fn host_ephemeral_range() -> Option<(u16, u16)> {
 /// -- which should be structurally impossible via [`expand_ports`], but is
 /// worth catching if the ledger file was hand-edited or corrupted.
 pub fn check_host(expanded_ports: &Value, cwd: &Path) -> Result<Vec<HostIssue>> {
-    let table = expanded_ports
-        .as_table()
-        .ok_or_else(|| Error::Runtime("[ports] must be a table".into()))?;
+    let resolved: ResolvedPorts = expanded_ports
+        .clone()
+        .try_into()
+        .map_err(|e| Error::Runtime(format!("[ports]: {e}")))?;
 
-    let mut infra_ports: Vec<(String, i64)> = Vec::new();
-    if let Some(infra) = table.get("infra").and_then(|v| v.as_table()) {
-        for (name, v) in infra {
-            if let Some(p) = v.as_integer() {
-                infra_ports.push((format!("infra.{name}"), p));
-            }
-        }
-    }
-    let mut service_ports: Vec<(String, i64)> = Vec::new();
-    if let Some(services) = table.get("services").and_then(|v| v.as_table()) {
-        for (name, v) in services {
-            if let Some(p) = v.as_integer() {
-                service_ports.push((format!("services.{name}"), p));
-            }
-        }
-    }
+    let infra_ports: Vec<(String, i64)> = resolved
+        .infra
+        .iter()
+        .map(|(name, port)| (format!("infra.{name}"), *port))
+        .collect();
+    let service_ports: Vec<(String, i64)> = resolved
+        .services
+        .iter()
+        .map(|(name, port)| (format!("services.{name}"), *port))
+        .collect();
     let all_ports: Vec<(String, i64)> = infra_ports
         .iter()
         .chain(service_ports.iter())
@@ -498,8 +496,11 @@ mod tests {
 
     #[test]
     fn test_check_host_no_issues_for_clean_config() {
+        // Below both Linux's (32768-60999) and macOS's (~49152-65535)
+        // default ephemeral ranges, so this doesn't trip the ephemeral-range
+        // warning on either CI or a dev machine.
         let ports: Value = r#"
-            band = 43000
+            band = 20000
             [infra]
             postgres = 0
             [services]
@@ -542,7 +543,7 @@ mod tests {
             .status()
             .unwrap();
 
-        let ports: Value = "band = 43000\n[services]\napp = 50".parse().unwrap();
+        let ports: Value = "band = 20000\n[services]\napp = 50".parse().unwrap();
 
         // These two branch names hash to the same bucket under the old
         // fnv1a-based scheme -- confirming the stateful ledger no longer
@@ -589,7 +590,7 @@ mod tests {
 
         // "main" is primary, so expand_ports never touches the ledger here --
         // this isolates check_host's integrity check from assign()'s own pruning.
-        let ports: Value = "band = 43000\n[services]\napp = 50".parse().unwrap();
+        let ports: Value = "band = 20000\n[services]\napp = 50".parse().unwrap();
         let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
         let issues = check_host(&expanded, dir.path()).unwrap();
         assert!(issues

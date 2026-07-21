@@ -1559,28 +1559,12 @@ mod tests {
 
         // main/master is unborn HEAD's symbolic ref by default in a fresh
         // `git init`, so slot should be 0 and app == band + lane.
-        let branch = get(&bc.config, "ports.branch").unwrap().as_str().unwrap();
-        let slot = get(&bc.config, "ports.slot").unwrap().as_integer().unwrap();
+        let resolved = crate::ports::from_config(&bc.config).unwrap();
+        assert_eq!(resolved.infra["postgres"], 4300);
+        assert_eq!(resolved.services["app"], 4300 + 50 + resolved.slot as i64);
         assert_eq!(
-            get(&bc.config, "ports.infra.postgres")
-                .unwrap()
-                .as_integer()
-                .unwrap(),
-            4300
-        );
-        assert_eq!(
-            get(&bc.config, "ports.services.app")
-                .unwrap()
-                .as_integer()
-                .unwrap(),
-            4300 + 50 + slot
-        );
-        assert_eq!(
-            get(&bc.config, "ports.branch_slug")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            crate::ports::slugify(branch)
+            resolved.branch_slug,
+            crate::ports::slugify(&resolved.branch)
         );
 
         // ports.* values are ordinary refs, resolvable from elsewhere in the file.

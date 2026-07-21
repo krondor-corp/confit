@@ -51,19 +51,33 @@ struct PortsSpec {
 }
 
 /// The shape of a `[ports]` table after [`expand_ports`]: what confit.toml's
-/// `{ports.*}` refs resolve against, and what [`check_host`] reads back.
-/// `infra`/`services` here hold fully-resolved ports, not offsets/lanes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ResolvedPorts {
-    band: i64,
-    branch: String,
-    branch_slug: String,
-    slot: u8,
-    primary_branches: Vec<String>,
+/// `{ports.*}` refs resolve against. Get one from a built config with
+/// [`from_config`] -- don't re-derive these fields by hand with
+/// `config::get`/`.as_str()`/`.as_integer()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedPorts {
+    pub band: i64,
+    pub branch: String,
+    pub branch_slug: String,
+    pub slot: u8,
+    pub primary_branches: Vec<String>,
+    /// Fully-resolved ports (not offsets), keyed by name.
     #[serde(default)]
-    infra: BTreeMap<String, i64>,
+    pub infra: BTreeMap<String, i64>,
+    /// Fully-resolved ports (not lanes), keyed by name.
     #[serde(default)]
-    services: BTreeMap<String, i64>,
+    pub services: BTreeMap<String, i64>,
+}
+
+/// Read the `[ports]` section back out of an already-[`expand_ports`]-ed
+/// config as a typed [`ResolvedPorts`], instead of `config::get(cfg,
+/// "ports.whatever")` + `.as_str()`/`.as_integer()` at every call site.
+pub fn from_config(config: &Value) -> Result<ResolvedPorts> {
+    let ports = crate::config::get(config, "ports")?;
+    ports
+        .clone()
+        .try_into()
+        .map_err(|e| Error::Runtime(format!("[ports]: {e}")))
 }
 
 /// The current branch name, via [`Git::current_branch`].
@@ -191,18 +205,13 @@ fn host_ephemeral_range() -> Option<(u16, u16)> {
     None
 }
 
-/// Validate an already-[`expand_ports`]-ed `[ports]` table against this
-/// host: within-file port collisions, privileged/out-of-range ports, ports
-/// inside the host's ephemeral range, service ports already bound, and (by
-/// reading the [`crate::slots`] ledger) two branches somehow sharing a slot
-/// -- which should be structurally impossible via [`expand_ports`], but is
-/// worth catching if the ledger file was hand-edited or corrupted.
-pub fn check_host(expanded_ports: &Value, cwd: &Path) -> Result<Vec<HostIssue>> {
-    let resolved: ResolvedPorts = expanded_ports
-        .clone()
-        .try_into()
-        .map_err(|e| Error::Runtime(format!("[ports]: {e}")))?;
-
+/// Validate a [`ResolvedPorts`] against this host: within-file port
+/// collisions, privileged/out-of-range ports, ports inside the host's
+/// ephemeral range, service ports already bound, and (by reading the
+/// [`crate::slots`] ledger) two branches somehow sharing a slot -- which
+/// should be structurally impossible via [`expand_ports`], but is worth
+/// catching if the ledger file was hand-edited or corrupted.
+pub fn check_host(resolved: &ResolvedPorts, cwd: &Path) -> Result<Vec<HostIssue>> {
     let infra_ports: Vec<(String, i64)> = resolved
         .infra
         .iter()
@@ -336,6 +345,10 @@ mod tests {
         dir
     }
 
+    fn resolved(expanded: &Value) -> ResolvedPorts {
+        expanded.clone().try_into().unwrap()
+    }
+
     #[test]
     fn test_slugify_basic() {
         assert_eq!(slugify("feature/foo-bar"), "feature-foo-bar");
@@ -455,7 +468,7 @@ mod tests {
         .unwrap();
         let dir = init_repo();
         let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&expanded, dir.path()).unwrap();
+        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
         assert!(issues
             .iter()
             .any(|i| i.severity == Severity::Error && i.message.contains("collides")));
@@ -472,7 +485,7 @@ mod tests {
         .unwrap();
         let dir = init_repo();
         let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&expanded, dir.path()).unwrap();
+        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
         assert!(issues
             .iter()
             .any(|i| i.severity == Severity::Warning && i.message.contains("privileged")));
@@ -489,7 +502,7 @@ mod tests {
             .unwrap();
         let dir = init_repo();
         let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&expanded, dir.path()).unwrap();
+        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
         assert!(issues.iter().any(|i| i.message.contains("already bound")));
         drop(listener);
     }
@@ -510,7 +523,7 @@ mod tests {
         .unwrap();
         let dir = init_repo();
         let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&expanded, dir.path()).unwrap();
+        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
         assert!(
             issues
                 .iter()
@@ -573,7 +586,7 @@ mod tests {
         assert_ne!(slots[0], slots[1]);
 
         let expanded = expand_ports(&ports, "feature/b7", dir.path()).unwrap();
-        let issues = check_host(&expanded, dir.path()).unwrap();
+        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
         assert!(
             issues.is_empty(),
             "expected no host issues, got: {issues:?}"
@@ -592,7 +605,7 @@ mod tests {
         // this isolates check_host's integrity check from assign()'s own pruning.
         let ports: Value = "band = 20000\n[services]\napp = 50".parse().unwrap();
         let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&expanded, dir.path()).unwrap();
+        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
         assert!(issues
             .iter()
             .any(|i| i.severity == Severity::Error

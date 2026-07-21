@@ -58,8 +58,8 @@ impl Op for Validate {
         // corruption. Read-only and cheap, so there's no reason to gate it
         // behind a flag.
         if section_in_scope("ports") {
-            if let Ok(ports) = confit_core::config::get(&bc.config, "ports") {
-                let issues = confit_core::ports::check_host(ports, &bc.config_dir)?;
+            if let Ok(resolved) = confit_core::ports::from_config(&bc.config) {
+                let issues = confit_core::ports::check_host(&resolved, &bc.config_dir)?;
                 for issue in &issues {
                     let line = format!("ports.{}: {}", issue.path, issue.message);
                     match issue.severity {

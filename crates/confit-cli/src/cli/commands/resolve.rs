@@ -35,7 +35,8 @@ impl Op for Resolve {
     type Error = ResolveError;
 
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
-        let resolved = confit_core::config::resolve(&self.path, !self.no_eval, ctx.vars())?;
+        let cfg = confit_core::config::Config::build(None, ctx.vars(), None)?;
+        let resolved = cfg.resolve(&self.path, !self.no_eval)?;
         let display = if resolved.secret && !self.reveal {
             "***".to_string()
         } else {

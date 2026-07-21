@@ -49,6 +49,27 @@ confit --set stage=production --set region=eu-west resolve infra.endpoint
 
 CLI flags override both env and TOML.
 
+### declaration is required
+
+Every name passed via `--set` or `CONFIT_VAR_*` must already exist as a key
+in `[vars]` (or be pinned by the active [profile](/docs/profiles/)'s own
+`vars` table) -- checked immediately, before anything is resolved:
+
+```bash
+$ confit --set stagee=production resolve infra.endpoint
+Error: 'stagee' is not declared in [vars]; add it to confit.toml's
+[vars] section, or check for a typo
+```
+
+This exists to catch a mistyped flag or a stray `CONFIT_VAR_*` left over
+from another project -- both would otherwise silently do nothing. Declare a
+default even if every real invocation overrides it:
+
+```toml
+[vars]
+stage = ""
+```
+
 ## using variables in config
 
 Reference variables with `{vars.name}`:
@@ -79,4 +100,8 @@ Error: Variable 'stage' is not set. Define it in [vars] in confit.toml,
 pass --set stage=VALUE, or set CONFIT_VAR_STAGE
 ```
 
-This error only fires when you actually try to resolve a path that needs the variable. Reading `project.name` won't fail just because `stage` is unset.
+This particular error only fires when you actually try to resolve a path
+that needs the variable -- reading `project.name` won't fail just because
+`stage` is unset. That's different from an *undeclared* `--set`/`CONFIT_VAR_*`
+name, which fails immediately (see above) regardless of which path you
+resolve.

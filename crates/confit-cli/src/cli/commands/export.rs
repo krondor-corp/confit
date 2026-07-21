@@ -172,26 +172,19 @@ impl Op for Export {
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
         // Compose the list of sections to resolve: the profile (if any) first,
         // then any explicit sections, so explicit sections win on conflict.
+        // A profile may also pin its own vars via [env.<name>.vars]; Config::build
+        // layers those in so e.g. `stage` resolves without --set at the call site.
         let mut paths: Vec<String> = Vec::new();
-        let mut profile_vars = HashMap::new();
         if let Some(name) = &self.profile {
-            let profile_path = format!("env.{name}");
-            // A profile may pin its own vars via [env.<name>.vars]; layer them in
-            // so e.g. `stage` resolves without `--set` at the call site.
-            profile_vars = confit_core::config::read_profile_vars(&profile_path)?;
-            paths.push(profile_path);
+            paths.push(format!("env.{name}"));
         }
         paths.extend(self.sections.iter().cloned());
         if paths.is_empty() {
             return Err(ExportError::NoSource);
         }
 
-        let pairs = confit_core::config::env_multi_with_vars(
-            &paths,
-            &profile_vars,
-            !self.no_eval,
-            ctx.vars(),
-        )?;
+        let cfg = confit_core::config::Config::build(None, ctx.vars(), self.profile.as_deref())?;
+        let pairs = cfg.env_multi(&paths, !self.no_eval)?;
         if self.upper {
             check_upper_collisions(&pairs)?;
         }

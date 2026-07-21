@@ -597,91 +597,445 @@ fn resolve_providers_inner(
     }
 }
 
-pub struct BuiltConfig {
-    pub config: Value,
+pub struct Config {
+    /// The generic, arbitrary-shaped part of confit.toml -- user-defined
+    /// sections, resolved lazily per path via `{ref}`/`$(...)`/`scheme://`.
+    /// `[ports]`'s resolved values are mirrored in here too (as plain
+    /// literals) so `{ports.*}` refs work exactly like any other value.
+    pub tree: Value,
     pub providers: Value,
     pub sources: Value,
     pub merged_vars: HashMap<String, String>,
     pub config_dir: PathBuf,
+    /// The typed, confit-owned `[ports]` section, if the file has one.
+    /// `None` means there's no `[ports]` table at all -- not that it failed
+    /// to parse; a malformed `[ports]` fails `Config::build` outright.
+    pub ports: Option<crate::ports::ResolvedPorts>,
 }
 
-pub fn build_config(
-    path: Option<&Path>,
-    runtime_vars: &HashMap<String, String>,
-) -> Result<BuiltConfig> {
-    build_config_layered(path, &HashMap::new(), runtime_vars)
-}
+impl Config {
+    /// Load and resolve confit.toml (or the file at `path`) once.
+    ///
+    /// `vars` are `--set`-style overrides. Every key in `vars`, and every
+    /// `CONFIT_VAR_*` environment variable, must already exist as a key in
+    /// `[vars]` -- this catches a typo like `--set stagee=prod` at build
+    /// time instead of the value silently going unused.
+    ///
+    /// `profile`, if given, must name an existing `[env.<profile>]` section
+    /// (an unknown profile is an error, not a silent no-op). Its `vars`
+    /// sub-table, if any, is layered in between `[vars]` and
+    /// `CONFIT_VAR_*`/`vars` -- so a profile can pin values (e.g. `stage`)
+    /// without requiring `--set` at the call site. Precedence, lowest to
+    /// highest: `[vars]` < profile `vars` < `CONFIT_VAR_*` < `vars`.
+    ///
+    /// If the file has a `[ports]` section, it's parsed and resolved here
+    /// too (see [`ports::resolve`](crate::ports::resolve)): a malformed
+    /// `[ports]` table fails construction immediately, the same as any
+    /// other structural problem.
+    pub fn build(
+        path: Option<&Path>,
+        vars: &HashMap<String, String>,
+        profile: Option<&str>,
+    ) -> Result<Config> {
+        let path = match path {
+            Some(p) => p.to_path_buf(),
+            None => find_config()?,
+        };
+        let mut raw = load_raw(&path)?;
 
-/// Like [`build_config`], but layers an additional set of variable defaults
-/// (e.g. vars pinned by an env profile) between the `[vars]` section and the
-/// ambient `CONFIT_VAR_*` / `--set` overrides.
-///
-/// Precedence, lowest to highest: `[vars]` < `profile_vars` < `CONFIT_VAR_*` < runtime.
-pub fn build_config_layered(
-    path: Option<&Path>,
-    profile_vars: &HashMap<String, String>,
-    runtime_vars: &HashMap<String, String>,
-) -> Result<BuiltConfig> {
-    let path = match path {
-        Some(p) => p.to_path_buf(),
-        None => find_config()?,
-    };
-    let mut raw = load_raw(&path)?;
+        let (providers, sources) = {
+            let table = raw
+                .as_table_mut()
+                .ok_or_else(|| Error::Runtime("Config root must be a table".into()))?;
+            (
+                table
+                    .remove("providers")
+                    .unwrap_or(Value::Table(Map::new())),
+                table.remove("sources").unwrap_or(Value::Table(Map::new())),
+            )
+        };
 
-    let table = raw
-        .as_table_mut()
-        .ok_or_else(|| Error::Runtime("Config root must be a table".into()))?;
+        let declared_table = raw
+            .as_table()
+            .and_then(|t| t.get("vars"))
+            .and_then(|v| v.as_table());
+        let mut declared_vars: HashSet<String> = declared_table
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+        let vars_section: HashMap<String, String> = declared_table
+            .map(|t| {
+                t.iter()
+                    .map(|(k, v)| (k.clone(), value_to_string(v)))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-    let providers = table
-        .remove("providers")
-        .unwrap_or(Value::Table(Map::new()));
+        let profile_vars = match profile {
+            None => HashMap::new(),
+            Some(name) => {
+                let profile_path = format!("env.{name}");
+                get(&raw, &profile_path).map_err(|_| {
+                    Error::Runtime(format!(
+                        "profile '{name}' not found (no [env.{name}] section in confit.toml)"
+                    ))
+                })?;
+                match get(&raw, &format!("{profile_path}.vars")) {
+                    Ok(Value::Table(t)) => t
+                        .iter()
+                        .map(|(k, v)| (k.clone(), value_to_string(v)))
+                        .collect(),
+                    _ => HashMap::new(),
+                }
+            }
+        };
+        // A profile's own `vars.*` pins are a legitimate declaration too --
+        // e.g. `[env.dev.vars] stage = "development"` with no top-level
+        // [vars] at all, then `--set stage=staging` overriding it.
+        declared_vars.extend(profile_vars.keys().cloned());
 
-    let sources = table.remove("sources").unwrap_or(Value::Table(Map::new()));
+        let env_vars = collect_env_vars();
 
-    let vars_section: HashMap<String, String> = table
-        .get("vars")
-        .and_then(|v| v.as_table())
-        .map(|t| {
-            t.iter()
-                .map(|(k, v)| (k.clone(), value_to_string(v)))
-                .collect()
+        // Every name explicitly supplied by the caller (env + `vars`) must
+        // already be declared in [vars] (or pinned by the active profile) --
+        // catches typos like `--set stagee=prod` instead of letting the
+        // value silently do nothing.
+        for name in env_vars.keys().chain(vars.keys()) {
+            if !declared_vars.contains(name) {
+                return Err(Error::Runtime(format!(
+                    "'{name}' is not declared in [vars]; add it to confit.toml's \
+                     [vars] section, or check for a typo"
+                )));
+            }
+        }
+
+        let mut merged_vars = vars_section;
+        merged_vars.extend(profile_vars);
+        merged_vars.extend(env_vars);
+        merged_vars.extend(vars.clone());
+
+        let config_dir = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // Resolve [ports] (if present) before the vars/ports tables are
+        // written back, so this reads the user-declared `infra`/`services`
+        // offsets, not anything already-resolved.
+        let ports_raw = raw.as_table().and_then(|t| t.get("ports")).cloned();
+        let ports = match ports_raw {
+            Some(v) => {
+                let branch = crate::ports::current_branch(&config_dir)?;
+                Some(crate::ports::resolve(&v, &branch, &config_dir)?)
+            }
+            None => None,
+        };
+
+        let table = raw.as_table_mut().unwrap();
+        let vars_table: Map<String, Value> = merged_vars
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect();
+        table.insert("vars".into(), Value::Table(vars_table));
+        if let Some(resolved) = &ports {
+            let ports_tree =
+                Value::try_from(resolved).map_err(|e| Error::Runtime(format!("[ports]: {e}")))?;
+            table.insert("ports".into(), ports_tree);
+        }
+
+        Ok(Config {
+            tree: raw,
+            providers,
+            sources,
+            merged_vars,
+            config_dir,
+            ports,
         })
-        .unwrap_or_default();
-
-    let env_vars = collect_env_vars();
-    let mut merged_vars = vars_section;
-    merged_vars.extend(profile_vars.clone());
-    merged_vars.extend(env_vars);
-    merged_vars.extend(runtime_vars.clone());
-
-    // Update vars section in config with merged values
-    let vars_table: Map<String, Value> = merged_vars
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect();
-    table.insert("vars".into(), Value::Table(vars_table));
-
-    let config_dir = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    if let Some(ports) = table.get("ports") {
-        let branch = crate::ports::current_branch(&config_dir)?;
-        let expanded = crate::ports::expand_ports(ports, &branch, &config_dir)?;
-        table.insert("ports".into(), expanded);
     }
 
-    Ok(BuiltConfig {
-        config: raw,
-        providers,
-        sources,
-        merged_vars,
-        config_dir,
-    })
-}
+    pub fn resolve(&self, dotted_path: &str, eval_providers: bool) -> Result<Resolved> {
+        let node = get(&self.tree, dotted_path)?;
+        let value = interpolate_node(node, &self.tree)?;
+        let mut secrets = HashSet::new();
+        let mut source_cache = SourceCache::new();
+        let (value, is_leaf_secret) = if eval_providers {
+            let value = eval_shells(&value, Some(&self.config_dir))?;
+            let leaf_secret = match &value {
+                Value::String(s) => {
+                    resolve_provider(
+                        s,
+                        &self.providers,
+                        &self.sources,
+                        &self.merged_vars,
+                        Some(&self.config_dir),
+                        &mut source_cache,
+                    )?
+                    .1
+                }
+                _ => false,
+            };
+            let resolved = resolve_providers(
+                &value,
+                &self.providers,
+                &self.sources,
+                &self.merged_vars,
+                Some(&self.config_dir),
+                &mut secrets,
+                &mut source_cache,
+            )?;
+            (resolved, leaf_secret)
+        } else {
+            (value, false)
+        };
+        match &value {
+            Value::Table(_) => Err(Error::Lookup(format!(
+                "'{dotted_path}' is a section, not a value.                  Use 'confit keys {dotted_path}' to list keys or                  'confit show {dotted_path}' for KEY=VALUE output."
+            ))),
+            Value::Array(arr) => Ok(Resolved {
+                value: arr
+                    .iter()
+                    .map(value_to_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                secret: is_leaf_secret || !secrets.is_empty(),
+            }),
+            other => Ok(Resolved {
+                value: value_to_string(other),
+                secret: is_leaf_secret || !secrets.is_empty(),
+            }),
+        }
+    }
 
-// --- High-level API ---
+    pub fn keys(&self, dotted_path: &str) -> Result<Vec<String>> {
+        let node = get(&self.tree, dotted_path)?;
+        match node.as_table() {
+            Some(table) => Ok(table.keys().cloned().collect()),
+            None => Err(Error::Lookup(format!("'{dotted_path}' is not a section"))),
+        }
+    }
+
+    /// Resolve a single section's leaf keys into env pairs, sharing a
+    /// [`SourceCache`] across calls so a bulk source loads at most once.
+    fn env_with_cache(
+        &self,
+        dotted_path: &str,
+        eval_providers: bool,
+        source_cache: &mut SourceCache,
+    ) -> Result<Vec<EnvPair>> {
+        let node = get(&self.tree, dotted_path)?;
+        let interpolated = interpolate_node(node, &self.tree)?;
+        let table = match interpolated.as_table() {
+            Some(t) => t,
+            None => return Err(Error::Lookup(format!("'{dotted_path}' is not a section"))),
+        };
+        let mut leaves = Map::new();
+        for (k, v) in table {
+            if !v.is_table() {
+                leaves.insert(k.clone(), v.clone());
+            }
+        }
+        let leaves = Value::Table(leaves);
+        let mut secrets = HashSet::new();
+        let resolved = if eval_providers {
+            let leaves = eval_shells(&leaves, Some(&self.config_dir))?;
+            resolve_providers(
+                &leaves,
+                &self.providers,
+                &self.sources,
+                &self.merged_vars,
+                Some(&self.config_dir),
+                &mut secrets,
+                source_cache,
+            )?
+        } else {
+            leaves
+        };
+        let table = resolved.as_table().unwrap();
+        Ok(table
+            .iter()
+            .map(|(k, v)| EnvPair {
+                key: k.clone(),
+                value: value_to_string(v),
+                secret: secrets.contains(k.as_str()),
+            })
+            .collect())
+    }
+
+    pub fn env(&self, dotted_path: &str, eval_providers: bool) -> Result<Vec<EnvPair>> {
+        let mut source_cache = SourceCache::new();
+        self.env_with_cache(dotted_path, eval_providers, &mut source_cache)
+    }
+
+    /// Resolve one or more sections into a single ordered set of env pairs.
+    ///
+    /// Sections are composed left-to-right; on a key conflict the later
+    /// section wins (its value replaces the earlier one, keeping the
+    /// original position).
+    pub fn env_multi(&self, dotted_paths: &[String], eval_providers: bool) -> Result<Vec<EnvPair>> {
+        let mut source_cache = SourceCache::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut by_key: HashMap<String, EnvPair> = HashMap::new();
+        for path in dotted_paths {
+            for pair in self.env_with_cache(path, eval_providers, &mut source_cache)? {
+                if !by_key.contains_key(&pair.key) {
+                    order.push(pair.key.clone());
+                }
+                by_key.insert(pair.key.clone(), pair);
+            }
+        }
+        Ok(order
+            .into_iter()
+            .map(|k| by_key.remove(&k).unwrap())
+            .collect())
+    }
+
+    /// Try to resolve every leaf value in the config; returns per-path
+    /// success/failure instead of stopping at the first error.
+    pub fn validate(&self) -> Vec<(String, bool, String)> {
+        let mut results = Vec::new();
+        let mut source_cache = SourceCache::new();
+
+        #[allow(clippy::too_many_arguments)]
+        fn walk(
+            node: &Value,
+            prefix: &str,
+            config: &Value,
+            providers: &Value,
+            sources: &Value,
+            merged_vars: &HashMap<String, String>,
+            config_dir: &Path,
+            results: &mut Vec<(String, bool, String)>,
+            source_cache: &mut SourceCache,
+        ) {
+            match node {
+                Value::Table(map) => {
+                    for (k, v) in map {
+                        let path = if prefix.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{prefix}.{k}")
+                        };
+                        walk(
+                            v,
+                            &path,
+                            config,
+                            providers,
+                            sources,
+                            merged_vars,
+                            config_dir,
+                            results,
+                            source_cache,
+                        );
+                    }
+                }
+                Value::Array(arr) => {
+                    for (i, item) in arr.iter().enumerate() {
+                        let path = format!("{prefix}[{i}]");
+                        walk(
+                            item,
+                            &path,
+                            config,
+                            providers,
+                            sources,
+                            merged_vars,
+                            config_dir,
+                            results,
+                            source_cache,
+                        );
+                    }
+                }
+                Value::String(s) => {
+                    let resolving = HashSet::new();
+                    match interpolate_value(s, config, &resolving)
+                        .and_then(|v| eval_shell(&v, Some(config_dir)))
+                        .and_then(|v| {
+                            resolve_provider(
+                                &v,
+                                providers,
+                                sources,
+                                merged_vars,
+                                Some(config_dir),
+                                source_cache,
+                            )
+                            .map(|(val, _)| val)
+                        }) {
+                        Ok(_) => results.push((prefix.to_string(), true, String::new())),
+                        Err(e) => results.push((prefix.to_string(), false, e.to_string())),
+                    }
+                }
+                _ => {
+                    results.push((prefix.to_string(), true, String::new()));
+                }
+            }
+        }
+
+        walk(
+            &self.tree,
+            "",
+            &self.tree,
+            &self.providers,
+            &self.sources,
+            &self.merged_vars,
+            &self.config_dir,
+            &mut results,
+            &mut source_cache,
+        );
+        results
+    }
+
+    pub fn yaml_section(
+        &self,
+        dotted_path: &str,
+        eval_providers: bool,
+        wrap: Option<&str>,
+        reveal: bool,
+    ) -> Result<String> {
+        let node = get(&self.tree, dotted_path)?;
+        let mut resolved = interpolate_node(node, &self.tree)?;
+        let mut secrets = HashSet::new();
+        let mut source_cache = SourceCache::new();
+        if eval_providers {
+            resolved = eval_shells(&resolved, Some(&self.config_dir))?;
+            resolved = resolve_providers(
+                &resolved,
+                &self.providers,
+                &self.sources,
+                &self.merged_vars,
+                Some(&self.config_dir),
+                &mut secrets,
+                &mut source_cache,
+            )?;
+        }
+        if !reveal {
+            mask_secrets(&mut resolved, &secrets, "");
+        }
+        if let Some(key) = wrap {
+            let mut wrapper = Map::new();
+            wrapper.insert(key.to_string(), resolved);
+            resolved = Value::Table(wrapper);
+        }
+        Ok(yaml::to_yaml(&resolved))
+    }
+
+    pub fn load(&self, eval_providers: bool) -> Result<Value> {
+        let interpolated = interpolate_node(&self.tree, &self.tree)?;
+        if eval_providers {
+            let evaled = eval_shells(&interpolated, Some(&self.config_dir))?;
+            let mut secrets = HashSet::new();
+            let mut source_cache = SourceCache::new();
+            resolve_providers(
+                &evaled,
+                &self.providers,
+                &self.sources,
+                &self.merged_vars,
+                Some(&self.config_dir),
+                &mut secrets,
+                &mut source_cache,
+            )
+        } else {
+            Ok(interpolated)
+        }
+    }
+}
 
 /// Resolved value with secret metadata.
 pub struct Resolved {
@@ -689,331 +1043,11 @@ pub struct Resolved {
     pub secret: bool,
 }
 
-pub fn resolve(
-    dotted_path: &str,
-    eval_providers: bool,
-    runtime_vars: &HashMap<String, String>,
-) -> Result<Resolved> {
-    let bc = build_config(None, runtime_vars)?;
-    let node = get(&bc.config, dotted_path)?;
-    let value = interpolate_node(node, &bc.config)?;
-    let mut secrets = HashSet::new();
-    let mut source_cache = SourceCache::new();
-    let (value, is_leaf_secret) = if eval_providers {
-        let value = eval_shells(&value, Some(&bc.config_dir))?;
-        let leaf_secret = match &value {
-            Value::String(s) => {
-                resolve_provider(
-                    s,
-                    &bc.providers,
-                    &bc.sources,
-                    &bc.merged_vars,
-                    Some(&bc.config_dir),
-                    &mut source_cache,
-                )?
-                .1
-            }
-            _ => false,
-        };
-        let resolved = resolve_providers(
-            &value,
-            &bc.providers,
-            &bc.sources,
-            &bc.merged_vars,
-            Some(&bc.config_dir),
-            &mut secrets,
-            &mut source_cache,
-        )?;
-        (resolved, leaf_secret)
-    } else {
-        (value, false)
-    };
-    match &value {
-        Value::Table(_) => Err(Error::Lookup(format!(
-            "'{dotted_path}' is a section, not a value. \
-             Use 'confit keys {dotted_path}' to list keys or \
-             'confit show {dotted_path}' for KEY=VALUE output."
-        ))),
-        Value::Array(arr) => Ok(Resolved {
-            value: arr
-                .iter()
-                .map(value_to_string)
-                .collect::<Vec<_>>()
-                .join(" "),
-            secret: is_leaf_secret || !secrets.is_empty(),
-        }),
-        other => Ok(Resolved {
-            value: value_to_string(other),
-            secret: is_leaf_secret || !secrets.is_empty(),
-        }),
-    }
-}
-
-pub fn keys(dotted_path: &str, runtime_vars: &HashMap<String, String>) -> Result<Vec<String>> {
-    let bc = build_config(None, runtime_vars)?;
-    let node = get(&bc.config, dotted_path)?;
-    match node.as_table() {
-        Some(table) => Ok(table.keys().cloned().collect()),
-        None => Err(Error::Lookup(format!("'{dotted_path}' is not a section"))),
-    }
-}
-
 /// Env pair with secret metadata.
 pub struct EnvPair {
     pub key: String,
     pub value: String,
     pub secret: bool,
-}
-
-/// Resolve a single section's leaf keys into env pairs against an already-built
-/// config, sharing a [`SourceCache`] so bulk sources load at most once across
-/// multiple sections.
-fn env_from_built(
-    bc: &BuiltConfig,
-    dotted_path: &str,
-    eval_providers: bool,
-    source_cache: &mut SourceCache,
-) -> Result<Vec<EnvPair>> {
-    let node = get(&bc.config, dotted_path)?;
-    let interpolated = interpolate_node(node, &bc.config)?;
-    let table = match interpolated.as_table() {
-        Some(t) => t,
-        None => return Err(Error::Lookup(format!("'{dotted_path}' is not a section"))),
-    };
-    let mut leaves = Map::new();
-    for (k, v) in table {
-        if !v.is_table() {
-            leaves.insert(k.clone(), v.clone());
-        }
-    }
-    let leaves = Value::Table(leaves);
-    let mut secrets = HashSet::new();
-    let resolved = if eval_providers {
-        let leaves = eval_shells(&leaves, Some(&bc.config_dir))?;
-        resolve_providers(
-            &leaves,
-            &bc.providers,
-            &bc.sources,
-            &bc.merged_vars,
-            Some(&bc.config_dir),
-            &mut secrets,
-            source_cache,
-        )?
-    } else {
-        leaves
-    };
-    let table = resolved.as_table().unwrap();
-    Ok(table
-        .iter()
-        .map(|(k, v)| EnvPair {
-            key: k.clone(),
-            value: value_to_string(v),
-            secret: secrets.contains(k.as_str()),
-        })
-        .collect())
-}
-
-pub fn env(
-    dotted_path: &str,
-    eval_providers: bool,
-    runtime_vars: &HashMap<String, String>,
-) -> Result<Vec<EnvPair>> {
-    let bc = build_config(None, runtime_vars)?;
-    let mut source_cache = SourceCache::new();
-    env_from_built(&bc, dotted_path, eval_providers, &mut source_cache)
-}
-
-/// Resolve one or more sections into a single ordered set of env pairs.
-///
-/// Sections are composed left-to-right; on a key conflict the later section
-/// wins (its value replaces the earlier one, keeping the original position).
-pub fn env_multi(
-    dotted_paths: &[String],
-    eval_providers: bool,
-    runtime_vars: &HashMap<String, String>,
-) -> Result<Vec<EnvPair>> {
-    env_multi_with_vars(dotted_paths, &HashMap::new(), eval_providers, runtime_vars)
-}
-
-/// Like [`env_multi`], but layers `profile_vars` into resolution (see
-/// [`build_config_layered`] for precedence). Used so an env profile can pin its
-/// own vars (e.g. `stage`) without requiring `--set` at the call site.
-///
-/// A single [`SourceCache`] is shared across every section, so a `[sources]`
-/// bag referenced from multiple sections is loaded only once.
-pub fn env_multi_with_vars(
-    dotted_paths: &[String],
-    profile_vars: &HashMap<String, String>,
-    eval_providers: bool,
-    runtime_vars: &HashMap<String, String>,
-) -> Result<Vec<EnvPair>> {
-    let bc = build_config_layered(None, profile_vars, runtime_vars)?;
-    let mut source_cache = SourceCache::new();
-    let mut order: Vec<String> = Vec::new();
-    let mut by_key: HashMap<String, EnvPair> = HashMap::new();
-    for path in dotted_paths {
-        for pair in env_from_built(&bc, path, eval_providers, &mut source_cache)? {
-            if !by_key.contains_key(&pair.key) {
-                order.push(pair.key.clone());
-            }
-            by_key.insert(pair.key.clone(), pair);
-        }
-    }
-    Ok(order
-        .into_iter()
-        .map(|k| by_key.remove(&k).unwrap())
-        .collect())
-}
-
-/// Read the literal `vars` sub-table of a profile section (e.g. `env.dev.vars`),
-/// returning an empty map if the profile or its `vars` table is absent.
-pub fn read_profile_vars(profile_path: &str) -> Result<HashMap<String, String>> {
-    let path = find_config()?;
-    let raw = load_raw(&path)?;
-    let vars_path = format!("{profile_path}.vars");
-    match get(&raw, &vars_path) {
-        Ok(Value::Table(t)) => Ok(t
-            .iter()
-            .map(|(k, v)| (k.clone(), value_to_string(v)))
-            .collect()),
-        _ => Ok(HashMap::new()),
-    }
-}
-
-pub fn validate(runtime_vars: &HashMap<String, String>) -> Result<Vec<(String, bool, String)>> {
-    let bc = build_config(None, runtime_vars)?;
-    Ok(validate_built(&bc))
-}
-
-/// Like [`validate`], but against an already-[`build_config`]'d config --
-/// for callers that need the [`BuiltConfig`] for something else too (e.g.
-/// checking a `[ports]` section against the host) and shouldn't parse
-/// confit.toml a second time to get it.
-pub fn validate_built(bc: &BuiltConfig) -> Vec<(String, bool, String)> {
-    let mut results = Vec::new();
-    let mut source_cache = SourceCache::new();
-
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        node: &Value,
-        prefix: &str,
-        config: &Value,
-        providers: &Value,
-        sources: &Value,
-        merged_vars: &HashMap<String, String>,
-        config_dir: &Path,
-        results: &mut Vec<(String, bool, String)>,
-        source_cache: &mut SourceCache,
-    ) {
-        match node {
-            Value::Table(map) => {
-                for (k, v) in map {
-                    let path = if prefix.is_empty() {
-                        k.clone()
-                    } else {
-                        format!("{prefix}.{k}")
-                    };
-                    walk(
-                        v,
-                        &path,
-                        config,
-                        providers,
-                        sources,
-                        merged_vars,
-                        config_dir,
-                        results,
-                        source_cache,
-                    );
-                }
-            }
-            Value::Array(arr) => {
-                for (i, item) in arr.iter().enumerate() {
-                    let path = format!("{prefix}[{i}]");
-                    walk(
-                        item,
-                        &path,
-                        config,
-                        providers,
-                        sources,
-                        merged_vars,
-                        config_dir,
-                        results,
-                        source_cache,
-                    );
-                }
-            }
-            Value::String(s) => {
-                let resolving = HashSet::new();
-                match interpolate_value(s, config, &resolving)
-                    .and_then(|v| eval_shell(&v, Some(config_dir)))
-                    .and_then(|v| {
-                        resolve_provider(
-                            &v,
-                            providers,
-                            sources,
-                            merged_vars,
-                            Some(config_dir),
-                            source_cache,
-                        )
-                        .map(|(val, _)| val)
-                    }) {
-                    Ok(_) => results.push((prefix.to_string(), true, String::new())),
-                    Err(e) => results.push((prefix.to_string(), false, e.to_string())),
-                }
-            }
-            _ => {
-                results.push((prefix.to_string(), true, String::new()));
-            }
-        }
-    }
-
-    walk(
-        &bc.config,
-        "",
-        &bc.config,
-        &bc.providers,
-        &bc.sources,
-        &bc.merged_vars,
-        &bc.config_dir,
-        &mut results,
-        &mut source_cache,
-    );
-    results
-}
-
-pub fn yaml_section(
-    dotted_path: &str,
-    eval_providers: bool,
-    runtime_vars: &HashMap<String, String>,
-    wrap: Option<&str>,
-    reveal: bool,
-) -> Result<String> {
-    let bc = build_config(None, runtime_vars)?;
-    let node = get(&bc.config, dotted_path)?;
-    let mut resolved = interpolate_node(node, &bc.config)?;
-    let mut secrets = HashSet::new();
-    let mut source_cache = SourceCache::new();
-    if eval_providers {
-        resolved = eval_shells(&resolved, Some(&bc.config_dir))?;
-        resolved = resolve_providers(
-            &resolved,
-            &bc.providers,
-            &bc.sources,
-            &bc.merged_vars,
-            Some(&bc.config_dir),
-            &mut secrets,
-            &mut source_cache,
-        )?;
-    }
-    if !reveal {
-        mask_secrets(&mut resolved, &secrets, "");
-    }
-    if let Some(key) = wrap {
-        let mut wrapper = Map::new();
-        wrapper.insert(key.to_string(), resolved);
-        resolved = Value::Table(wrapper);
-    }
-    Ok(yaml::to_yaml(&resolved))
 }
 
 fn mask_secrets(node: &mut Value, secrets: &HashSet<String>, prefix: &str) {
@@ -1044,30 +1078,10 @@ fn mask_secrets(node: &mut Value, secrets: &HashSet<String>, prefix: &str) {
     }
 }
 
-pub fn load(eval_providers: bool, runtime_vars: &HashMap<String, String>) -> Result<Value> {
-    let bc = build_config(None, runtime_vars)?;
-    let interpolated = interpolate_node(&bc.config, &bc.config)?;
-    if eval_providers {
-        let evaled = eval_shells(&interpolated, Some(&bc.config_dir))?;
-        let mut secrets = HashSet::new();
-        let mut source_cache = SourceCache::new();
-        resolve_providers(
-            &evaled,
-            &bc.providers,
-            &bc.sources,
-            &bc.merged_vars,
-            Some(&bc.config_dir),
-            &mut secrets,
-            &mut source_cache,
-        )
-    } else {
-        Ok(interpolated)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
 
     fn write_config(dir: &Path, content: &str) -> PathBuf {
@@ -1434,6 +1448,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_build_config_with_vars() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1447,11 +1462,12 @@ mod tests {
         );
         let mut runtime = HashMap::new();
         runtime.insert("env".into(), "prod".into());
-        let bc = build_config(Some(&path), &runtime).unwrap();
+        let bc = Config::build(Some(&path), &runtime, None).unwrap();
         assert_eq!(bc.merged_vars["env"], "prod");
     }
 
     #[test]
+    #[serial]
     fn test_build_config_env_vars() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1462,12 +1478,13 @@ mod tests {
             "#,
         );
         std::env::set_var("CONFIT_VAR_REGION", "us-west-2");
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
         assert_eq!(bc.merged_vars["region"], "us-west-2");
         std::env::remove_var("CONFIT_VAR_REGION");
     }
 
     #[test]
+    #[serial]
     fn test_build_config_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1480,12 +1497,13 @@ mod tests {
         std::env::set_var("CONFIT_VAR_X", "from-env");
         let mut runtime = HashMap::new();
         runtime.insert("x".into(), "from-cli".into());
-        let bc = build_config(Some(&path), &runtime).unwrap();
+        let bc = Config::build(Some(&path), &runtime, None).unwrap();
         assert_eq!(bc.merged_vars["x"], "from-cli");
         std::env::remove_var("CONFIT_VAR_X");
     }
 
     #[test]
+    #[serial]
     fn test_end_to_end_resolve() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1498,13 +1516,14 @@ mod tests {
             port = 3000
             "#,
         );
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
-        let node = get(&bc.config, "app.name").unwrap();
-        let result = interpolate_node(node, &bc.config).unwrap();
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        let node = get(&bc.tree, "app.name").unwrap();
+        let result = interpolate_node(node, &bc.tree).unwrap();
         assert_eq!(result.as_str().unwrap(), "svc-test");
     }
 
     #[test]
+    #[serial]
     fn test_end_to_end_with_file_provider() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("db_pass.txt"), "hunter2\n").unwrap();
@@ -1515,9 +1534,9 @@ mod tests {
             password = "file://db_pass.txt"
             "#,
         );
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
-        let node = get(&bc.config, "db.password").unwrap();
-        let interpolated = interpolate_node(node, &bc.config).unwrap();
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        let node = get(&bc.tree, "db.password").unwrap();
+        let interpolated = interpolate_node(node, &bc.tree).unwrap();
         let (resolved, _) = resolve_provider(
             interpolated.as_str().unwrap(),
             &bc.providers,
@@ -1531,6 +1550,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_end_to_end_with_ports() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Command::new("git")
@@ -1555,11 +1575,11 @@ mod tests {
             url = "postgres://localhost:{ports.infra.postgres}/mydb"
             "#,
         );
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
 
         // main/master is unborn HEAD's symbolic ref by default in a fresh
         // `git init`, so slot should be 0 and app == band + lane.
-        let resolved = crate::ports::from_config(&bc.config).unwrap();
+        let resolved = bc.ports.as_ref().unwrap();
         assert_eq!(resolved.infra["postgres"], 4300);
         assert_eq!(resolved.services["app"], 4300 + 50 + resolved.slot as i64);
         assert_eq!(
@@ -1568,8 +1588,8 @@ mod tests {
         );
 
         // ports.* values are ordinary refs, resolvable from elsewhere in the file.
-        let node = get(&bc.config, "db.url").unwrap();
-        let interpolated = interpolate_node(node, &bc.config).unwrap();
+        let node = get(&bc.tree, "db.url").unwrap();
+        let interpolated = interpolate_node(node, &bc.tree).unwrap();
         assert_eq!(
             interpolated.as_str().unwrap(),
             "postgres://localhost:4300/mydb"
@@ -1577,6 +1597,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_end_to_end_with_shell() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1586,14 +1607,15 @@ mod tests {
             hash = "$(echo abc123)"
             "#,
         );
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
-        let node = get(&bc.config, "build.hash").unwrap();
-        let interpolated = interpolate_node(node, &bc.config).unwrap();
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        let node = get(&bc.tree, "build.hash").unwrap();
+        let interpolated = interpolate_node(node, &bc.tree).unwrap();
         let evaled = eval_shell(interpolated.as_str().unwrap(), Some(&bc.config_dir)).unwrap();
         assert_eq!(evaled, "abc123");
     }
 
     #[test]
+    #[serial]
     fn test_env_output() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1607,9 +1629,9 @@ mod tests {
             name = "mydb-{vars.stage}"
             "#,
         );
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
-        let node = get(&bc.config, "db").unwrap();
-        let interpolated = interpolate_node(node, &bc.config).unwrap();
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        let node = get(&bc.tree, "db").unwrap();
+        let interpolated = interpolate_node(node, &bc.tree).unwrap();
         let table = interpolated.as_table().unwrap();
 
         let mut pairs: Vec<(String, String)> = table
@@ -1644,6 +1666,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_providers_section_removed() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1655,12 +1678,13 @@ mod tests {
             secret = "op://vault/item/field"
             "#,
         );
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
-        assert!(bc.config.as_table().unwrap().get("providers").is_none());
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        assert!(bc.tree.as_table().unwrap().get("providers").is_none());
         assert!(bc.providers.as_table().unwrap().contains_key("op"));
     }
 
     #[test]
+    #[serial]
     fn test_sources_section_removed() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1672,8 +1696,8 @@ mod tests {
             val = "mysrc://FOO"
             "#,
         );
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
-        assert!(bc.config.as_table().unwrap().get("sources").is_none());
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        assert!(bc.tree.as_table().unwrap().get("sources").is_none());
         assert!(bc.sources.as_table().unwrap().contains_key("mysrc"));
     }
 
@@ -1925,6 +1949,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_source_end_to_end_via_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -1936,9 +1961,9 @@ mod tests {
             val = "bag://FOO"
             "#,
         );
-        let bc = build_config(Some(&path), &HashMap::new()).unwrap();
-        let node = get(&bc.config, "app.val").unwrap();
-        let interpolated = interpolate_node(node, &bc.config).unwrap();
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        let node = get(&bc.tree, "app.val").unwrap();
+        let interpolated = interpolate_node(node, &bc.tree).unwrap();
         let mut cache = SourceCache::new();
         let (resolved, _) = resolve_provider(
             interpolated.as_str().unwrap(),

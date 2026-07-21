@@ -32,7 +32,8 @@ impl Op for Keys {
     type Error = KeysError;
 
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
-        let keys = confit_core::config::keys(&self.section, ctx.vars())?;
+        let cfg = confit_core::config::Config::build(None, ctx.vars(), None)?;
+        let keys = cfg.keys(&self.section)?;
         Ok(KeysOutput(keys))
     }
 }

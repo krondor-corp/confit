@@ -33,12 +33,8 @@ impl Op for Validate {
     type Error = ValidateError;
 
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
-        let bc = confit_core::config::build_config(None, ctx.vars())?;
-        let mut results = confit_core::config::validate_built(&bc);
-        let section_in_scope = |section: &str| match &self.section {
-            None => true,
-            Some(s) => s == section || s.starts_with(&format!("{section}.")),
-        };
+        let bc = confit_core::config::Config::build(None, ctx.vars(), None)?;
+        let mut results = bc.validate();
         if let Some(ref s) = self.section {
             let prefix = format!("{s}.");
             results.retain(|(p, _, _)| p == s || p.starts_with(&prefix));
@@ -52,27 +48,25 @@ impl Op for Validate {
                 failures += 1;
             }
         }
-        // Whenever [ports] is in scope, also check it against this host:
+        // If there's a [ports] section, also check it against this host:
         // collisions, privileged/out-of-range ports, ports inside the
         // host's ephemeral range, service ports already bound, and ledger
         // corruption. Read-only and cheap, so there's no reason to gate it
-        // behind a flag.
-        if section_in_scope("ports") {
-            if let Ok(resolved) = confit_core::ports::from_config(&bc.config) {
-                let issues = confit_core::ports::check_host(&resolved, &bc.config_dir)?;
-                for issue in &issues {
-                    let line = format!("ports.{}: {}", issue.path, issue.message);
-                    match issue.severity {
-                        confit_core::ports::Severity::Error => {
-                            ui::failure(&line);
-                            failures += 1;
-                        }
-                        confit_core::ports::Severity::Warning => ui::warning(&line),
+        // behind a flag or section filter.
+        if let Some(resolved) = &bc.ports {
+            let issues = confit_core::ports::check_host(resolved, &bc.config_dir)?;
+            for issue in &issues {
+                let line = format!("ports.{}: {}", issue.path, issue.message);
+                match issue.severity {
+                    confit_core::ports::Severity::Error => {
+                        ui::failure(&line);
+                        failures += 1;
                     }
+                    confit_core::ports::Severity::Warning => ui::warning(&line),
                 }
-                if issues.is_empty() {
-                    ui::success("ports: no issues found on this host");
-                }
+            }
+            if issues.is_empty() {
+                ui::success("ports: no issues found on this host");
             }
         }
 

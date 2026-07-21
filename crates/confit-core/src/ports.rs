@@ -19,10 +19,11 @@
 //! site = 70
 //! ```
 //!
-//! expands (say the branch is assigned slot 3) into `ports.branch`,
-//! `ports.branch_slug`, `ports.slot`, `ports.infra.postgres = 4300`,
-//! `ports.services.app = 4353`, etc. — ordinary values, resolved through the
-//! same `{ref}` pipeline as everything else in confit.toml.
+//! [`resolve`] turns this into a [`ResolvedPorts`] (say the branch is
+//! assigned slot 3): `branch`, `branch_slug`, `slot`,
+//! `infra.postgres = 4300`, `services.app = 4353`, etc. [`crate::config`]
+//! mirrors those fields back into the generic config tree so confit.toml's
+//! `{ports.*}` refs resolve against them like any other value.
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -36,7 +37,7 @@ use crate::git::Git;
 
 const DEFAULT_PRIMARY_BRANCHES: &[&str] = &["main", "master"];
 
-/// The declared shape of a `[ports]` table, before expansion. Deserialized
+/// The declared shape of a `[ports]` table, before resolution. Deserialized
 /// directly from the raw `toml::Value` -- no manual `.get()`/`.as_*()`
 /// field-by-field poking.
 #[derive(Debug, Deserialize)]
@@ -50,10 +51,8 @@ struct PortsSpec {
     services: BTreeMap<String, i64>,
 }
 
-/// The shape of a `[ports]` table after [`expand_ports`]: what confit.toml's
-/// `{ports.*}` refs resolve against. Get one from a built config with
-/// [`from_config`] -- don't re-derive these fields by hand with
-/// `config::get`/`.as_str()`/`.as_integer()`.
+/// A `[ports]` table after [`resolve`]. `infra`/`services` hold
+/// fully-resolved ports here, not offsets/lanes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPorts {
     pub band: i64,
@@ -67,17 +66,6 @@ pub struct ResolvedPorts {
     /// Fully-resolved ports (not lanes), keyed by name.
     #[serde(default)]
     pub services: BTreeMap<String, i64>,
-}
-
-/// Read the `[ports]` section back out of an already-[`expand_ports`]-ed
-/// config as a typed [`ResolvedPorts`], instead of `config::get(cfg,
-/// "ports.whatever")` + `.as_str()`/`.as_integer()` at every call site.
-pub fn from_config(config: &Value) -> Result<ResolvedPorts> {
-    let ports = crate::config::get(config, "ports")?;
-    ports
-        .clone()
-        .try_into()
-        .map_err(|e| Error::Runtime(format!("[ports]: {e}")))
 }
 
 /// The current branch name, via [`Git::current_branch`].
@@ -111,11 +99,11 @@ fn is_primary_branch(branch: &str, primary_branches: &[String]) -> bool {
     }
 }
 
-/// Expand a `[ports]` table: resolves `infra.*` to `band + offset`,
-/// `services.*` to `band + lane + slot`, and adds `branch`, `branch_slug`,
-/// `slot` as plain values alongside `band`. `slot` comes from the ledger in
+/// Resolve a `[ports]` table: `infra.*` becomes `band + offset`,
+/// `services.*` becomes `band + lane + slot`, and `branch`/`branch_slug`/
+/// `slot` are added alongside `band`. `slot` comes from the ledger in
 /// [`crate::slots`], which requires `cwd` to be inside a git working tree.
-pub fn expand_ports(ports: &Value, branch: &str, cwd: &Path) -> Result<Value> {
+pub fn resolve(ports: &Value, branch: &str, cwd: &Path) -> Result<ResolvedPorts> {
     let spec: PortsSpec = ports
         .clone()
         .try_into()
@@ -137,7 +125,7 @@ pub fn expand_ports(ports: &Value, branch: &str, cwd: &Path) -> Result<Value> {
         spec.primary_branches
     };
 
-    let resolved = ResolvedPorts {
+    Ok(ResolvedPorts {
         band: spec.band,
         branch: branch.to_string(),
         branch_slug: slug,
@@ -153,9 +141,7 @@ pub fn expand_ports(ports: &Value, branch: &str, cwd: &Path) -> Result<Value> {
             .into_iter()
             .map(|(name, lane)| (name, spec.band + lane + slot as i64))
             .collect(),
-    };
-
-    Value::try_from(&resolved).map_err(|e| Error::Runtime(format!("[ports]: {e}")))
+    })
 }
 
 /// How serious a [`HostIssue`] is.
@@ -209,8 +195,8 @@ fn host_ephemeral_range() -> Option<(u16, u16)> {
 /// collisions, privileged/out-of-range ports, ports inside the host's
 /// ephemeral range, service ports already bound, and (by reading the
 /// [`crate::slots`] ledger) two branches somehow sharing a slot -- which
-/// should be structurally impossible via [`expand_ports`], but is worth
-/// catching if the ledger file was hand-edited or corrupted.
+/// should be structurally impossible via [`resolve`], but is worth catching
+/// if the ledger file was hand-edited or corrupted.
 pub fn check_host(resolved: &ResolvedPorts, cwd: &Path) -> Result<Vec<HostIssue>> {
     let infra_ports: Vec<(String, i64)> = resolved
         .infra
@@ -299,8 +285,8 @@ pub fn check_host(resolved: &ResolvedPorts, cwd: &Path) -> Result<Vec<HostIssue>
         }
     }
 
-    // Ledger integrity: expand_ports hands out each slot at most once, so
-    // two branches sharing a slot here means the ledger file was edited or
+    // Ledger integrity: resolve() hands out each slot at most once, so two
+    // branches sharing a slot here means the ledger file was edited or
     // corrupted out from under confit.
     if let Ok(ledger) = crate::slots::read(&Git::new(cwd)) {
         let mut by_slot: std::collections::HashMap<u8, Vec<&String>> =
@@ -345,10 +331,6 @@ mod tests {
         dir
     }
 
-    fn resolved(expanded: &Value) -> ResolvedPorts {
-        expanded.clone().try_into().unwrap()
-    }
-
     #[test]
     fn test_slugify_basic() {
         assert_eq!(slugify("feature/foo-bar"), "feature-foo-bar");
@@ -373,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_ports_infra_and_services() {
+    fn test_resolve_infra_and_services() {
         let ports: Value = r#"
             band = 4300
             [infra]
@@ -387,24 +369,19 @@ mod tests {
         .unwrap();
 
         let dir = init_repo();
-        let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let table = expanded.as_table().unwrap();
-        assert_eq!(table["band"].as_integer().unwrap(), 4300);
-        assert_eq!(table["branch"].as_str().unwrap(), "main");
-        assert_eq!(table["branch_slug"].as_str().unwrap(), "main");
-        assert_eq!(table["slot"].as_integer().unwrap(), 0);
-
-        let infra = table["infra"].as_table().unwrap();
-        assert_eq!(infra["postgres"].as_integer().unwrap(), 4300);
-        assert_eq!(infra["redis"].as_integer().unwrap(), 4301);
-
-        let services = table["services"].as_table().unwrap();
-        assert_eq!(services["app"].as_integer().unwrap(), 4350);
-        assert_eq!(services["site"].as_integer().unwrap(), 4370);
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        assert_eq!(resolved.band, 4300);
+        assert_eq!(resolved.branch, "main");
+        assert_eq!(resolved.branch_slug, "main");
+        assert_eq!(resolved.slot, 0);
+        assert_eq!(resolved.infra["postgres"], 4300);
+        assert_eq!(resolved.infra["redis"], 4301);
+        assert_eq!(resolved.services["app"], 4350);
+        assert_eq!(resolved.services["site"], 4370);
     }
 
     #[test]
-    fn test_expand_ports_feature_branch_offsets_services_not_infra() {
+    fn test_resolve_feature_branch_offsets_services_not_infra() {
         let ports: Value = r#"
             band = 4300
             [infra]
@@ -416,44 +393,25 @@ mod tests {
         .unwrap();
 
         let dir = init_repo();
-        let expanded = expand_ports(&ports, "feature/thing", dir.path()).unwrap();
-        let table = expanded.as_table().unwrap();
-        let slot = table["slot"].as_integer().unwrap();
-        assert!((1..=9).contains(&slot));
-        assert_eq!(
-            table["infra"].as_table().unwrap()["postgres"]
-                .as_integer()
-                .unwrap(),
-            4300
-        );
-        assert_eq!(
-            table["services"].as_table().unwrap()["app"]
-                .as_integer()
-                .unwrap(),
-            4300 + 50 + slot
-        );
+        let resolved = resolve(&ports, "feature/thing", dir.path()).unwrap();
+        assert!((1..=9).contains(&resolved.slot));
+        assert_eq!(resolved.infra["postgres"], 4300);
+        assert_eq!(resolved.services["app"], 4300 + 50 + resolved.slot as i64);
     }
 
     #[test]
-    fn test_expand_ports_requires_band() {
+    fn test_resolve_requires_band() {
         let ports: Value = "[infra]\npostgres = 0".parse().unwrap();
-        let result = expand_ports(&ports, "main", Path::new("."));
+        let result = resolve(&ports, "main", Path::new("."));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("band"));
     }
 
     #[test]
-    fn test_expand_ports_persists_primary_branches() {
+    fn test_resolve_persists_primary_branches() {
         let ports: Value = "band = 4300".parse().unwrap();
-        let expanded = expand_ports(&ports, "main", Path::new(".")).unwrap();
-        let table = expanded.as_table().unwrap();
-        let primary: Vec<&str> = table["primary_branches"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(primary, vec!["main", "master"]);
+        let resolved = resolve(&ports, "main", Path::new(".")).unwrap();
+        assert_eq!(resolved.primary_branches, vec!["main", "master"]);
     }
 
     #[test]
@@ -467,8 +425,8 @@ mod tests {
         .parse()
         .unwrap();
         let dir = init_repo();
-        let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
         assert!(issues
             .iter()
             .any(|i| i.severity == Severity::Error && i.message.contains("collides")));
@@ -484,8 +442,8 @@ mod tests {
         .parse()
         .unwrap();
         let dir = init_repo();
-        let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
         assert!(issues
             .iter()
             .any(|i| i.severity == Severity::Warning && i.message.contains("privileged")));
@@ -501,8 +459,8 @@ mod tests {
             .parse()
             .unwrap();
         let dir = init_repo();
-        let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
         assert!(issues.iter().any(|i| i.message.contains("already bound")));
         drop(listener);
     }
@@ -522,8 +480,8 @@ mod tests {
         .parse()
         .unwrap();
         let dir = init_repo();
-        let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
         assert!(
             issues
                 .iter()
@@ -533,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_ports_gives_distinct_slots_across_worktrees() {
+    fn test_resolve_gives_distinct_slots_across_worktrees() {
         let dir = init_repo();
         std::fs::write(dir.path().join("f.txt"), "x").unwrap();
         std::process::Command::new("git")
@@ -562,7 +520,7 @@ mod tests {
         // fnv1a-based scheme -- confirming the stateful ledger no longer
         // cares is the whole point of this test.
         let mut slots = Vec::new();
-        for (i, branch) in ["feature/b7", "feature/b36"].iter().enumerate() {
+        for branch in ["feature/b7", "feature/b36"] {
             let wt = tempfile::tempdir().unwrap();
             let wt_path = wt.path().join("wt");
             assert!(std::process::Command::new("git")
@@ -578,15 +536,14 @@ mod tests {
                 .status()
                 .unwrap()
                 .success());
-            let expanded = expand_ports(&ports, branch, dir.path()).unwrap();
-            slots.push(expanded["slot"].as_integer().unwrap());
+            let resolved = resolve(&ports, branch, dir.path()).unwrap();
+            slots.push(resolved.slot);
             std::mem::forget(wt); // keep the worktree alive for the rest of the test
-            let _ = i;
         }
         assert_ne!(slots[0], slots[1]);
 
-        let expanded = expand_ports(&ports, "feature/b7", dir.path()).unwrap();
-        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
+        let resolved = resolve(&ports, "feature/b7", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
         assert!(
             issues.is_empty(),
             "expected no host issues, got: {issues:?}"
@@ -601,11 +558,11 @@ mod tests {
         std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
         std::fs::write(&ledger_path, "\"feature/a\" = 3\n\"feature/b\" = 3\n").unwrap();
 
-        // "main" is primary, so expand_ports never touches the ledger here --
+        // "main" is primary, so resolve() never touches the ledger here --
         // this isolates check_host's integrity check from assign()'s own pruning.
         let ports: Value = "band = 20000\n[services]\napp = 50".parse().unwrap();
-        let expanded = expand_ports(&ports, "main", dir.path()).unwrap();
-        let issues = check_host(&resolved(&expanded), dir.path()).unwrap();
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
         assert!(issues
             .iter()
             .any(|i| i.severity == Severity::Error

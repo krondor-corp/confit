@@ -33,9 +33,10 @@ impl Op for Ssh {
     type Error = SshError;
 
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
+        let cfg = confit_core::config::Config::build(None, ctx.vars(), None)?;
         let mut openssh_keys = Vec::new();
         for k in &self.key {
-            let resolved = confit_core::config::resolve(k, true, ctx.vars())?;
+            let resolved = cfg.resolve(k, true)?;
             openssh_keys.push(confit_core::ssh::to_openssh(&resolved.value)?);
         }
 

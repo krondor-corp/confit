@@ -56,7 +56,8 @@ impl Op for Run {
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
         use std::os::unix::process::CommandExt;
 
-        let pairs = confit_core::config::env(&self.section, !self.no_eval, ctx.vars())?;
+        let cfg = confit_core::config::Config::build(None, ctx.vars(), None)?;
+        let pairs = cfg.env(&self.section, !self.no_eval)?;
         if self.upper {
             check_upper_collisions(&pairs)?;
         }

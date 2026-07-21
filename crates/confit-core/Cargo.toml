@@ -16,3 +16,4 @@ ed25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+serial_test.workspace = true

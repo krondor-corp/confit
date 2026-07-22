@@ -4,6 +4,7 @@ use std::process::Command;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde::Deserialize;
 use toml::map::Map;
 use toml::Value;
 
@@ -265,7 +266,136 @@ fn expand_template(
     Ok(result)
 }
 
-// --- Sources ---
+fn run_shell(cmd: &str, cwd: Option<&Path>) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new("sh");
+    command.args(["-c", cmd]);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command.output()
+}
+
+// --- Providers and sources ---
+//
+// Both accept a bare-string shorthand or a table in TOML; ProviderSpec and
+// SourceSpec parse either directly via serde instead of every call site
+// doing its own `.as_table()`/`.get(...)`/`.as_str()` walk. Each is a small
+// "runnable" type -- `ProviderSpec::resolve` and `SourceSpec::load` are the
+// only places that actually shell out.
+
+/// `[providers.<scheme>]`: resolves `scheme://path` by running `cmd` with
+/// `{path}`, `{uri}`, and any `--set`/`[vars]` name substituted in.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ProviderSpec {
+    Shorthand(String),
+    Full { cmd: String },
+}
+
+impl ProviderSpec {
+    fn cmd_template(&self) -> &str {
+        match self {
+            ProviderSpec::Shorthand(s) => s,
+            ProviderSpec::Full { cmd } => cmd,
+        }
+    }
+
+    /// Run this provider for `uri` (`path` is the part after `scheme://`).
+    fn resolve(
+        &self,
+        scheme: &str,
+        uri: &str,
+        path: &str,
+        vars: &HashMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> Result<String> {
+        let mut template_vars = vars.clone();
+        template_vars.insert("uri".into(), uri.into());
+        template_vars.insert("path".into(), path.into());
+        let cmd = expand_template(self.cmd_template(), &template_vars, scheme, uri)?;
+
+        let output =
+            run_shell(&cmd, cwd).map_err(|e| Error::Runtime(format!("Provider {scheme}: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Runtime(format!(
+                "Failed to eval '{uri}' via {scheme}: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+}
+
+/// `[sources.<name>]`: resolves `name://field` by running `load` once
+/// (bulk, dotenv-format output), caching the result, then looking up
+/// `field` in it. `secret = true` marks every field from this source as
+/// secret even without an explicit `secret://` prefix.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SourceSpec {
+    Shorthand(String),
+    Full {
+        load: String,
+        #[serde(default)]
+        secret: bool,
+    },
+}
+
+impl SourceSpec {
+    fn load_template(&self) -> &str {
+        match self {
+            SourceSpec::Shorthand(s) => s,
+            SourceSpec::Full { load, .. } => load,
+        }
+    }
+
+    fn is_secret(&self) -> bool {
+        matches!(self, SourceSpec::Full { secret: true, .. })
+    }
+
+    /// Run this source's load command once, parsing dotenv-format output
+    /// into a key -> value bag.
+    fn load(
+        &self,
+        name: &str,
+        vars: &HashMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> Result<HashMap<String, String>> {
+        let template = self.load_template();
+
+        // Reject {path} and {uri} — sources load a bag, they have no per-key path.
+        for cap in REF_RE.captures_iter(template) {
+            let key = &cap[1];
+            if key == "path" || key == "uri" {
+                return Err(Error::Runtime(format!(
+                    "Source '{name}' load template references '{{{key}}}' which is not \
+                     allowed (sources don't have per-key paths). \
+                     Use a provider for per-key substitution."
+                )));
+            }
+        }
+
+        // Support both {stage} and {vars.stage} in source load templates.
+        let template_vars: HashMap<String, String> = vars
+            .iter()
+            .flat_map(|(k, v)| [(k.clone(), v.clone()), (format!("vars.{k}"), v.clone())])
+            .collect();
+
+        let cmd = expand_template(template, &template_vars, name, name)?;
+
+        let output = run_shell(&cmd, cwd)
+            .map_err(|e| Error::Runtime(format!("Source '{name}' load failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Runtime(format!(
+                "Source '{name}' load command failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(parse_dotenv(&String::from_utf8_lossy(&output.stdout)))
+    }
+}
 
 /// Lazy cache for source loads within one resolution pass.
 pub struct SourceCache {
@@ -315,103 +445,32 @@ fn parse_dotenv(output: &str) -> HashMap<String, String> {
     map
 }
 
-fn source_is_secret(source_name: &str, sources: &Value) -> bool {
-    if let Some(table) = sources.as_table() {
-        if let Some(Value::Table(t)) = table.get(source_name) {
-            if let Some(Value::Boolean(b)) = t.get("secret") {
-                return *b;
-            }
-        }
-    }
-    false
+fn is_source(scheme: &str, sources: &HashMap<String, SourceSpec>) -> bool {
+    scheme == "env" || sources.contains_key(scheme)
 }
 
-/// Load a source's data (running the load command if needed).
-/// Returns the parsed key→value map.
-fn load_source_data(
-    source_name: &str,
-    sources: &Value,
-    runtime_vars: &HashMap<String, String>,
-    cwd: Option<&Path>,
-) -> Result<HashMap<String, String>> {
-    if source_name == "env" {
-        return Ok(std::env::vars().collect());
-    }
-
-    let sources_table = sources
-        .as_table()
-        .ok_or_else(|| Error::Runtime(format!("Source '{source_name}' not found")))?;
-    let source = sources_table
-        .get(source_name)
-        .ok_or_else(|| Error::Runtime(format!("Source '{source_name}' not found")))?;
-
-    let load_template = match source {
-        Value::String(s) => s.as_str(),
-        Value::Table(t) => match t.get("load").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => {
-                return Err(Error::Runtime(format!(
-                    "Source '{source_name}' table must have a 'load' field"
-                )))
-            }
-        },
-        _ => {
-            return Err(Error::Runtime(format!(
-                "Source '{source_name}' must be a string or table"
-            )))
-        }
-    };
-
-    // Reject {path} and {uri} — sources load a bag, they have no per-key path
-    for cap in REF_RE.captures_iter(load_template) {
-        let key = &cap[1];
-        if key == "path" || key == "uri" {
-            return Err(Error::Runtime(format!(
-                "Source '{source_name}' load template references '{{{key}}}' which is not \
-                 allowed (sources don't have per-key paths). \
-                 Use a provider for per-key substitution."
-            )));
-        }
-    }
-
-    // Support both {stage} and {vars.stage} in source load templates
-    let template_vars: HashMap<String, String> = runtime_vars
-        .iter()
-        .flat_map(|(k, v)| [(k.clone(), v.clone()), (format!("vars.{k}"), v.clone())])
-        .collect();
-
-    let cmd = expand_template(load_template, &template_vars, source_name, source_name)?;
-
-    let mut command = Command::new("sh");
-    command.args(["-c", &cmd]);
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    let output = command
-        .output()
-        .map_err(|e| Error::Runtime(format!("Source '{source_name}' load failed: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::Runtime(format!(
-            "Source '{source_name}' load command failed: {}",
-            stderr.trim()
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_dotenv(&stdout))
+fn source_is_secret(source_name: &str, sources: &HashMap<String, SourceSpec>) -> bool {
+    sources.get(source_name).is_some_and(|s| s.is_secret())
 }
 
 /// Resolve a field from a source, lazily loading and caching the source.
 fn resolve_from_source(
     source_name: &str,
     field: &str,
-    sources: &Value,
+    sources: &HashMap<String, SourceSpec>,
     runtime_vars: &HashMap<String, String>,
     cwd: Option<&Path>,
     cache: &mut SourceCache,
 ) -> Result<String> {
     if !cache.loaded.contains_key(source_name) {
-        let data = load_source_data(source_name, sources, runtime_vars, cwd)?;
+        let data = if source_name == "env" {
+            std::env::vars().collect()
+        } else {
+            let source = sources
+                .get(source_name)
+                .ok_or_else(|| Error::Runtime(format!("Source '{source_name}' not found")))?;
+            source.load(source_name, runtime_vars, cwd)?
+        };
         cache.loaded.insert(source_name.to_string(), data);
     }
     let data = cache.loaded.get(source_name).unwrap();
@@ -426,18 +485,11 @@ fn resolve_from_source(
     })
 }
 
-fn is_source(scheme: &str, sources: &Value) -> bool {
-    if scheme == "env" {
-        return true;
-    }
-    sources.as_table().is_some_and(|t| t.contains_key(scheme))
-}
-
 /// Resolve a single provider or source URI. Returns `(resolved_value, is_secret)`.
 pub fn resolve_provider(
     value: &str,
-    providers: &Value,
-    sources: &Value,
+    providers: &HashMap<String, ProviderSpec>,
+    sources: &HashMap<String, SourceSpec>,
     runtime_vars: &HashMap<String, String>,
     cwd: Option<&Path>,
     source_cache: &mut SourceCache,
@@ -467,54 +519,20 @@ pub fn resolve_provider(
         return Ok((resolved, is_secret));
     }
 
-    let providers_table = match providers.as_table() {
-        Some(t) => t,
-        None => return Ok((value.to_string(), secret)),
-    };
-    let provider = match providers_table.get(scheme) {
+    let provider = match providers.get(scheme) {
         Some(p) => p,
         None => return Ok((value.to_string(), secret)),
     };
 
-    let cmd_template = match provider {
-        Value::Table(t) => match t.get("cmd").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return Ok((value.to_string(), secret)),
-        },
-        Value::String(s) => s.as_str(),
-        _ => return Ok((value.to_string(), secret)),
-    };
-
     let path = &value[scheme.len() + 3..];
-    let mut template_vars = runtime_vars.clone();
-    template_vars.insert("uri".into(), value.into());
-    template_vars.insert("path".into(), path.into());
-
-    let cmd = expand_template(cmd_template, &template_vars, scheme, value)?;
-
-    let mut command = Command::new("sh");
-    command.args(["-c", &cmd]);
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    let output = command
-        .output()
-        .map_err(|e| Error::Runtime(format!("Provider {scheme}: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::Runtime(format!(
-            "Failed to eval '{value}' via {scheme}: {}",
-            stderr.trim()
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok((stdout.trim().to_string(), secret))
+    let resolved = provider.resolve(scheme, value, path, runtime_vars, cwd)?;
+    Ok((resolved, secret))
 }
 
 pub fn resolve_providers(
     node: &Value,
-    providers: &Value,
-    sources: &Value,
+    providers: &HashMap<String, ProviderSpec>,
+    sources: &HashMap<String, SourceSpec>,
     runtime_vars: &HashMap<String, String>,
     cwd: Option<&Path>,
     secrets: &mut HashSet<String>,
@@ -535,8 +553,8 @@ pub fn resolve_providers(
 #[allow(clippy::too_many_arguments)]
 fn resolve_providers_inner(
     node: &Value,
-    providers: &Value,
-    sources: &Value,
+    providers: &HashMap<String, ProviderSpec>,
+    sources: &HashMap<String, SourceSpec>,
     runtime_vars: &HashMap<String, String>,
     cwd: Option<&Path>,
     prefix: &str,
@@ -603,8 +621,8 @@ pub struct Config {
     /// `[ports]`'s resolved values are mirrored in here too (as plain
     /// literals) so `{ports.*}` refs work exactly like any other value.
     pub tree: Value,
-    pub providers: Value,
-    pub sources: Value,
+    pub providers: HashMap<String, ProviderSpec>,
+    pub sources: HashMap<String, SourceSpec>,
     pub merged_vars: HashMap<String, String>,
     pub config_dir: PathBuf,
     /// The typed, confit-owned `[ports]` section, if the file has one.
@@ -647,12 +665,19 @@ impl Config {
             let table = raw
                 .as_table_mut()
                 .ok_or_else(|| Error::Runtime("Config root must be a table".into()))?;
-            (
-                table
-                    .remove("providers")
-                    .unwrap_or(Value::Table(Map::new())),
-                table.remove("sources").unwrap_or(Value::Table(Map::new())),
-            )
+            let providers: HashMap<String, ProviderSpec> = match table.remove("providers") {
+                Some(v) => v
+                    .try_into()
+                    .map_err(|e| Error::Runtime(format!("[providers]: {e}")))?,
+                None => HashMap::new(),
+            };
+            let sources: HashMap<String, SourceSpec> = match table.remove("sources") {
+                Some(v) => v
+                    .try_into()
+                    .map_err(|e| Error::Runtime(format!("[sources]: {e}")))?,
+                None => HashMap::new(),
+            };
+            (providers, sources)
         };
 
         let declared_table = raw
@@ -752,6 +777,40 @@ impl Config {
         })
     }
 
+    /// Resolve one `scheme://...` (or plain) value against this config's
+    /// providers/sources/vars/cwd -- [`resolve_provider`] with the config's
+    /// own fields already supplied.
+    pub fn resolve_provider(&self, value: &str, cache: &mut SourceCache) -> Result<(String, bool)> {
+        resolve_provider(
+            value,
+            &self.providers,
+            &self.sources,
+            &self.merged_vars,
+            Some(&self.config_dir),
+            cache,
+        )
+    }
+
+    /// Recursively resolve every string leaf in `node` this way, tracking
+    /// which paths turned out secret -- [`resolve_providers`] with the
+    /// config's own fields already supplied.
+    fn resolve_providers(
+        &self,
+        node: &Value,
+        secrets: &mut HashSet<String>,
+        cache: &mut SourceCache,
+    ) -> Result<Value> {
+        resolve_providers(
+            node,
+            &self.providers,
+            &self.sources,
+            &self.merged_vars,
+            Some(&self.config_dir),
+            secrets,
+            cache,
+        )
+    }
+
     pub fn resolve(&self, dotted_path: &str, eval_providers: bool) -> Result<Resolved> {
         let node = get(&self.tree, dotted_path)?;
         let value = interpolate_node(node, &self.tree)?;
@@ -760,35 +819,19 @@ impl Config {
         let (value, is_leaf_secret) = if eval_providers {
             let value = eval_shells(&value, Some(&self.config_dir))?;
             let leaf_secret = match &value {
-                Value::String(s) => {
-                    resolve_provider(
-                        s,
-                        &self.providers,
-                        &self.sources,
-                        &self.merged_vars,
-                        Some(&self.config_dir),
-                        &mut source_cache,
-                    )?
-                    .1
-                }
+                Value::String(s) => self.resolve_provider(s, &mut source_cache)?.1,
                 _ => false,
             };
-            let resolved = resolve_providers(
-                &value,
-                &self.providers,
-                &self.sources,
-                &self.merged_vars,
-                Some(&self.config_dir),
-                &mut secrets,
-                &mut source_cache,
-            )?;
+            let resolved = self.resolve_providers(&value, &mut secrets, &mut source_cache)?;
             (resolved, leaf_secret)
         } else {
             (value, false)
         };
         match &value {
             Value::Table(_) => Err(Error::Lookup(format!(
-                "'{dotted_path}' is a section, not a value.                  Use 'confit keys {dotted_path}' to list keys or                  'confit show {dotted_path}' for KEY=VALUE output."
+                "'{dotted_path}' is a section, not a value. \
+                 Use 'confit keys {dotted_path}' to list keys or \
+                 'confit show {dotted_path}' for KEY=VALUE output."
             ))),
             Value::Array(arr) => Ok(Resolved {
                 value: arr
@@ -837,15 +880,7 @@ impl Config {
         let mut secrets = HashSet::new();
         let resolved = if eval_providers {
             let leaves = eval_shells(&leaves, Some(&self.config_dir))?;
-            resolve_providers(
-                &leaves,
-                &self.providers,
-                &self.sources,
-                &self.merged_vars,
-                Some(&self.config_dir),
-                &mut secrets,
-                source_cache,
-            )?
+            self.resolve_providers(&leaves, &mut secrets, source_cache)?
         } else {
             leaves
         };
@@ -899,8 +934,8 @@ impl Config {
             node: &Value,
             prefix: &str,
             config: &Value,
-            providers: &Value,
-            sources: &Value,
+            providers: &HashMap<String, ProviderSpec>,
+            sources: &HashMap<String, SourceSpec>,
             merged_vars: &HashMap<String, String>,
             config_dir: &Path,
             results: &mut Vec<(String, bool, String)>,
@@ -995,15 +1030,7 @@ impl Config {
         let mut source_cache = SourceCache::new();
         if eval_providers {
             resolved = eval_shells(&resolved, Some(&self.config_dir))?;
-            resolved = resolve_providers(
-                &resolved,
-                &self.providers,
-                &self.sources,
-                &self.merged_vars,
-                Some(&self.config_dir),
-                &mut secrets,
-                &mut source_cache,
-            )?;
+            resolved = self.resolve_providers(&resolved, &mut secrets, &mut source_cache)?;
         }
         if !reveal {
             mask_secrets(&mut resolved, &secrets, "");
@@ -1022,15 +1049,7 @@ impl Config {
             let evaled = eval_shells(&interpolated, Some(&self.config_dir))?;
             let mut secrets = HashSet::new();
             let mut source_cache = SourceCache::new();
-            resolve_providers(
-                &evaled,
-                &self.providers,
-                &self.sources,
-                &self.merged_vars,
-                Some(&self.config_dir),
-                &mut secrets,
-                &mut source_cache,
-            )
+            self.resolve_providers(&evaled, &mut secrets, &mut source_cache)
         } else {
             Ok(interpolated)
         }
@@ -1091,8 +1110,12 @@ mod tests {
         path
     }
 
-    fn empty_sources() -> Value {
-        Value::Table(Map::new())
+    fn empty_sources() -> HashMap<String, SourceSpec> {
+        HashMap::new()
+    }
+
+    fn empty_providers() -> HashMap<String, ProviderSpec> {
+        HashMap::new()
     }
 
     fn new_cache() -> SourceCache {
@@ -1225,7 +1248,7 @@ mod tests {
         let secret_path = dir.path().join("secret.txt");
         std::fs::write(&secret_path, "s3cret_value\n").unwrap();
 
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let uri = format!("file://{}", secret_path.display());
         let (result, secret) = resolve_provider(
@@ -1246,7 +1269,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("token.txt"), "abc123\n").unwrap();
 
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let (result, _) = resolve_provider(
             "file://token.txt",
@@ -1262,7 +1285,7 @@ mod tests {
 
     #[test]
     fn test_file_provider_missing() {
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let result = resolve_provider(
             "file:///nonexistent/file.txt",
@@ -1278,11 +1301,13 @@ mod tests {
 
     #[test]
     fn test_custom_provider() {
-        let providers: Value = r#"
+        let providers: HashMap<String, ProviderSpec> = r#"
             [echo]
             cmd = "echo resolved-{path}"
         "#
-        .parse()
+        .parse::<Value>()
+        .unwrap()
+        .try_into()
         .unwrap();
         let vars = HashMap::new();
         let (result, _) = resolve_provider(
@@ -1299,11 +1324,13 @@ mod tests {
 
     #[test]
     fn test_custom_provider_with_vars() {
-        let providers: Value = r#"
+        let providers: HashMap<String, ProviderSpec> = r#"
             [vault]
             cmd = "echo {stage}-{path}"
         "#
-        .parse()
+        .parse::<Value>()
+        .unwrap()
+        .try_into()
         .unwrap();
         let mut vars = HashMap::new();
         vars.insert("stage".into(), "prod".into());
@@ -1324,7 +1351,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("key.txt"), "my-secret\n").unwrap();
 
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let (result, secret) = resolve_provider(
             "secret://file://key.txt",
@@ -1341,7 +1368,7 @@ mod tests {
 
     #[test]
     fn test_secret_scheme_with_literal() {
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let (result, secret) = resolve_provider(
             "secret://literal-value",
@@ -1358,11 +1385,13 @@ mod tests {
 
     #[test]
     fn test_secret_scheme_with_custom_provider() {
-        let providers: Value = r#"
+        let providers: HashMap<String, ProviderSpec> = r#"
             [echo]
             cmd = "echo secret-{path}"
         "#
-        .parse()
+        .parse::<Value>()
+        .unwrap()
+        .try_into()
         .unwrap();
         let vars = HashMap::new();
         let (result, secret) = resolve_provider(
@@ -1380,11 +1409,13 @@ mod tests {
 
     #[test]
     fn test_non_secret_not_flagged() {
-        let providers: Value = r#"
+        let providers: HashMap<String, ProviderSpec> = r#"
             [echo]
             cmd = "echo val"
         "#
-        .parse()
+        .parse::<Value>()
+        .unwrap()
+        .try_into()
         .unwrap();
         let vars = HashMap::new();
         let (_, secret) = resolve_provider(
@@ -1410,7 +1441,7 @@ mod tests {
         "#
         .parse()
         .unwrap();
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let mut secrets = HashSet::new();
         let mut cache = new_cache();
@@ -1680,7 +1711,7 @@ mod tests {
         );
         let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
         assert!(bc.tree.as_table().unwrap().get("providers").is_none());
-        assert!(bc.providers.as_table().unwrap().contains_key("op"));
+        assert!(bc.providers.contains_key("op"));
     }
 
     #[test]
@@ -1698,7 +1729,7 @@ mod tests {
         );
         let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
         assert!(bc.tree.as_table().unwrap().get("sources").is_none());
-        assert!(bc.sources.as_table().unwrap().contains_key("mysrc"));
+        assert!(bc.sources.contains_key("mysrc"));
     }
 
     #[test]
@@ -1755,9 +1786,10 @@ mod tests {
 
     #[test]
     fn test_source_string_shorthand() {
-        let mut sources_map = Map::new();
-        sources_map.insert("mysrc".into(), Value::String("echo FOO=hello".into()));
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "mysrc".to_string(),
+            SourceSpec::Shorthand("echo FOO=hello".into()),
+        )]);
 
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
@@ -1770,11 +1802,13 @@ mod tests {
 
     #[test]
     fn test_source_table_form() {
-        let mut sources_map = Map::new();
-        let mut src_table = Map::new();
-        src_table.insert("load".into(), Value::String("echo BAR=world".into()));
-        sources_map.insert("mysrc".into(), Value::Table(src_table));
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "mysrc".to_string(),
+            SourceSpec::Full {
+                load: "echo BAR=world".into(),
+                secret: false,
+            },
+        )]);
 
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
@@ -1785,9 +1819,10 @@ mod tests {
 
     #[test]
     fn test_source_missing_field_errors() {
-        let mut sources_map = Map::new();
-        sources_map.insert("mysrc".into(), Value::String("echo FOO=hello".into()));
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "mysrc".to_string(),
+            SourceSpec::Shorthand("echo FOO=hello".into()),
+        )]);
 
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
@@ -1799,9 +1834,10 @@ mod tests {
     #[test]
     fn test_source_cached_single_load() {
         // The source outputs a random suffix each call; caching means we get the same value twice
-        let mut sources_map = Map::new();
-        sources_map.insert("mysrc".into(), Value::String("echo FOO=$(date +%N)".into()));
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "mysrc".to_string(),
+            SourceSpec::Shorthand("echo FOO=$(date +%N)".into()),
+        )]);
 
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
@@ -1813,11 +1849,12 @@ mod tests {
 
     #[test]
     fn test_source_via_resolve_provider() {
-        let mut sources_map = Map::new();
-        sources_map.insert("myenv".into(), Value::String("echo KEY=resolved".into()));
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "myenv".to_string(),
+            SourceSpec::Shorthand("echo KEY=resolved".into()),
+        )]);
 
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
         let (val, secret) =
@@ -1828,14 +1865,15 @@ mod tests {
 
     #[test]
     fn test_source_secret_flag() {
-        let mut sources_map = Map::new();
-        let mut src = Map::new();
-        src.insert("load".into(), Value::String("echo PASS=hunter2".into()));
-        src.insert("secret".into(), Value::Boolean(true));
-        sources_map.insert("vault".into(), Value::Table(src));
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "vault".to_string(),
+            SourceSpec::Full {
+                load: "echo PASS=hunter2".into(),
+                secret: true,
+            },
+        )]);
 
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
         let (val, secret) = resolve_provider(
@@ -1856,11 +1894,12 @@ mod tests {
 
     #[test]
     fn test_source_secret_prefix_composes() {
-        let mut sources_map = Map::new();
-        sources_map.insert("plain".into(), Value::String("echo TOKEN=abc123".into()));
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "plain".to_string(),
+            SourceSpec::Shorthand("echo TOKEN=abc123".into()),
+        )]);
 
-        let providers = Value::Table(Map::new());
+        let providers = empty_providers();
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
         let (val, secret) = resolve_provider(
@@ -1879,8 +1918,8 @@ mod tests {
     #[test]
     fn test_env_source_builtin() {
         unsafe { std::env::set_var("TEST_CONFIT_BUILTIN", "hello_builtin") };
-        let providers = Value::Table(Map::new());
-        let sources = Value::Table(Map::new());
+        let providers = empty_providers();
+        let sources = empty_sources();
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
         let (val, _) = resolve_provider(
@@ -1899,8 +1938,8 @@ mod tests {
     #[test]
     fn test_env_source_missing_errors() {
         std::env::remove_var("TEST_CONFIT_DEFINITELY_NOT_SET_XYZ");
-        let providers = Value::Table(Map::new());
-        let sources = Value::Table(Map::new());
+        let providers = empty_providers();
+        let sources = empty_sources();
         let vars = HashMap::new();
         let mut cache = SourceCache::new();
         let result = resolve_provider(
@@ -1920,12 +1959,10 @@ mod tests {
 
     #[test]
     fn test_source_vars_interpolation() {
-        let mut sources_map = Map::new();
-        sources_map.insert(
-            "mysrc".into(),
-            Value::String("echo STAGE={vars.stage}".into()),
-        );
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "mysrc".to_string(),
+            SourceSpec::Shorthand("echo STAGE={vars.stage}".into()),
+        )]);
 
         let mut vars = HashMap::new();
         vars.insert("stage".into(), "prod".into());
@@ -1937,9 +1974,10 @@ mod tests {
 
     #[test]
     fn test_source_rejects_path_in_template() {
-        let mut sources_map = Map::new();
-        sources_map.insert("bad".into(), Value::String("echo {path}=value".into()));
-        let sources = Value::Table(sources_map);
+        let sources = HashMap::from([(
+            "bad".to_string(),
+            SourceSpec::Shorthand("echo {path}=value".into()),
+        )]);
 
         let vars = HashMap::new();
         let mut cache = SourceCache::new();

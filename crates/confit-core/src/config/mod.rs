@@ -17,6 +17,7 @@ pub use interpolate::{get, interpolate_node, interpolate_value};
 pub use providers::{resolve_provider, resolve_providers, ProviderSpec, SourceCache, SourceSpec};
 pub use shell::{eval_shell, eval_shells};
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -84,6 +85,11 @@ pub struct Config {
     /// `None` means there's no `[ports]` table at all -- not that it failed
     /// to parse; a malformed `[ports]` fails `Config::build` outright.
     pub ports: Option<crate::ports::ResolvedPorts>,
+    /// Sources are loaded (and their `load` command run) at most once per
+    /// `Config`, the first time something actually references them --
+    /// shared across every `resolve`/`env`/`validate`/... call on `&self`,
+    /// not recreated per call.
+    source_cache: RefCell<SourceCache>,
 }
 
 impl Config {
@@ -229,32 +235,29 @@ impl Config {
             merged_vars,
             config_dir,
             ports,
+            source_cache: RefCell::new(SourceCache::new()),
         })
     }
 
     /// Resolve one `scheme://...` (or plain) value against this config's
     /// providers/sources/vars/cwd -- [`resolve_provider`] with the config's
-    /// own fields already supplied.
-    pub fn resolve_provider(&self, value: &str, cache: &mut SourceCache) -> Result<(String, bool)> {
+    /// own fields already supplied. Shares this `Config`'s source cache, so
+    /// a source referenced across several calls loads at most once.
+    pub fn resolve_provider(&self, value: &str) -> Result<(String, bool)> {
         resolve_provider(
             value,
             &self.providers,
             &self.sources,
             &self.merged_vars,
             Some(&self.config_dir),
-            cache,
+            &mut self.source_cache.borrow_mut(),
         )
     }
 
     /// Recursively resolve every string leaf in `node` this way, tracking
     /// which paths turned out secret -- [`resolve_providers`] with the
     /// config's own fields already supplied.
-    fn resolve_providers(
-        &self,
-        node: &Value,
-        secrets: &mut HashSet<String>,
-        cache: &mut SourceCache,
-    ) -> Result<Value> {
+    fn resolve_providers(&self, node: &Value, secrets: &mut HashSet<String>) -> Result<Value> {
         resolve_providers(
             node,
             &self.providers,
@@ -262,7 +265,7 @@ impl Config {
             &self.merged_vars,
             Some(&self.config_dir),
             secrets,
-            cache,
+            &mut self.source_cache.borrow_mut(),
         )
     }
 
@@ -270,14 +273,13 @@ impl Config {
         let node = get(&self.tree, dotted_path)?;
         let value = interpolate_node(node, &self.tree)?;
         let mut secrets = HashSet::new();
-        let mut source_cache = SourceCache::new();
         let (value, is_leaf_secret) = if eval_providers {
             let value = eval_shells(&value, Some(&self.config_dir))?;
             let leaf_secret = match &value {
-                Value::String(s) => self.resolve_provider(s, &mut source_cache)?.1,
+                Value::String(s) => self.resolve_provider(s)?.1,
                 _ => false,
             };
-            let resolved = self.resolve_providers(&value, &mut secrets, &mut source_cache)?;
+            let resolved = self.resolve_providers(&value, &mut secrets)?;
             (resolved, leaf_secret)
         } else {
             (value, false)
@@ -311,14 +313,7 @@ impl Config {
         }
     }
 
-    /// Resolve a single section's leaf keys into env pairs, sharing a
-    /// [`SourceCache`] across calls so a bulk source loads at most once.
-    fn env_with_cache(
-        &self,
-        dotted_path: &str,
-        eval_providers: bool,
-        source_cache: &mut SourceCache,
-    ) -> Result<Vec<EnvPair>> {
+    pub fn env(&self, dotted_path: &str, eval_providers: bool) -> Result<Vec<EnvPair>> {
         let node = get(&self.tree, dotted_path)?;
         let interpolated = interpolate_node(node, &self.tree)?;
         let table = match interpolated.as_table() {
@@ -335,7 +330,7 @@ impl Config {
         let mut secrets = HashSet::new();
         let resolved = if eval_providers {
             let leaves = eval_shells(&leaves, Some(&self.config_dir))?;
-            self.resolve_providers(&leaves, &mut secrets, source_cache)?
+            self.resolve_providers(&leaves, &mut secrets)?
         } else {
             leaves
         };
@@ -350,22 +345,16 @@ impl Config {
             .collect())
     }
 
-    pub fn env(&self, dotted_path: &str, eval_providers: bool) -> Result<Vec<EnvPair>> {
-        let mut source_cache = SourceCache::new();
-        self.env_with_cache(dotted_path, eval_providers, &mut source_cache)
-    }
-
     /// Resolve one or more sections into a single ordered set of env pairs.
     ///
     /// Sections are composed left-to-right; on a key conflict the later
     /// section wins (its value replaces the earlier one, keeping the
     /// original position).
     pub fn env_multi(&self, dotted_paths: &[String], eval_providers: bool) -> Result<Vec<EnvPair>> {
-        let mut source_cache = SourceCache::new();
         let mut order: Vec<String> = Vec::new();
         let mut by_key: HashMap<String, EnvPair> = HashMap::new();
         for path in dotted_paths {
-            for pair in self.env_with_cache(path, eval_providers, &mut source_cache)? {
+            for pair in self.env(path, eval_providers)? {
                 if !by_key.contains_key(&pair.key) {
                     order.push(pair.key.clone());
                 }
@@ -382,7 +371,6 @@ impl Config {
     /// success/failure instead of stopping at the first error.
     pub fn validate(&self) -> Vec<(String, bool, String)> {
         let mut results = Vec::new();
-        let mut source_cache = SourceCache::new();
 
         #[allow(clippy::too_many_arguments)]
         fn walk(
@@ -467,7 +455,7 @@ impl Config {
             &self.merged_vars,
             &self.config_dir,
             &mut results,
-            &mut source_cache,
+            &mut self.source_cache.borrow_mut(),
         );
         results
     }
@@ -482,10 +470,9 @@ impl Config {
         let node = get(&self.tree, dotted_path)?;
         let mut resolved = interpolate_node(node, &self.tree)?;
         let mut secrets = HashSet::new();
-        let mut source_cache = SourceCache::new();
         if eval_providers {
             resolved = eval_shells(&resolved, Some(&self.config_dir))?;
-            resolved = self.resolve_providers(&resolved, &mut secrets, &mut source_cache)?;
+            resolved = self.resolve_providers(&resolved, &mut secrets)?;
         }
         if !reveal {
             mask_secrets(&mut resolved, &secrets, "");
@@ -503,8 +490,7 @@ impl Config {
         if eval_providers {
             let evaled = eval_shells(&interpolated, Some(&self.config_dir))?;
             let mut secrets = HashSet::new();
-            let mut source_cache = SourceCache::new();
-            self.resolve_providers(&evaled, &mut secrets, &mut source_cache)
+            self.resolve_providers(&evaled, &mut secrets)
         } else {
             Ok(interpolated)
         }
@@ -564,10 +550,6 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
-    }
-
-    fn new_cache() -> SourceCache {
-        SourceCache::new()
     }
 
     #[test]
@@ -656,9 +638,8 @@ mod tests {
             "#,
         );
         let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
-        let node = get(&bc.tree, "app.name").unwrap();
-        let result = interpolate_node(node, &bc.tree).unwrap();
-        assert_eq!(result.as_str().unwrap(), "svc-test");
+        let result = bc.resolve("app.name", false).unwrap();
+        assert_eq!(result.value, "svc-test");
     }
 
     #[test]
@@ -674,18 +655,8 @@ mod tests {
             "#,
         );
         let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
-        let node = get(&bc.tree, "db.password").unwrap();
-        let interpolated = interpolate_node(node, &bc.tree).unwrap();
-        let (resolved, _) = resolve_provider(
-            interpolated.as_str().unwrap(),
-            &bc.providers,
-            &bc.sources,
-            &bc.merged_vars,
-            Some(&bc.config_dir),
-            &mut new_cache(),
-        )
-        .unwrap();
-        assert_eq!(resolved, "hunter2");
+        let resolved = bc.resolve("db.password", true).unwrap();
+        assert_eq!(resolved.value, "hunter2");
     }
 
     #[test]
@@ -727,12 +698,8 @@ mod tests {
         );
 
         // ports.* values are ordinary refs, resolvable from elsewhere in the file.
-        let node = get(&bc.tree, "db.url").unwrap();
-        let interpolated = interpolate_node(node, &bc.tree).unwrap();
-        assert_eq!(
-            interpolated.as_str().unwrap(),
-            "postgres://localhost:4300/mydb"
-        );
+        let resolved = bc.resolve("db.url", false).unwrap();
+        assert_eq!(resolved.value, "postgres://localhost:4300/mydb");
     }
 
     #[test]
@@ -747,10 +714,8 @@ mod tests {
             "#,
         );
         let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
-        let node = get(&bc.tree, "build.hash").unwrap();
-        let interpolated = interpolate_node(node, &bc.tree).unwrap();
-        let evaled = eval_shell(interpolated.as_str().unwrap(), Some(&bc.config_dir)).unwrap();
-        assert_eq!(evaled, "abc123");
+        let resolved = bc.resolve("build.hash", true).unwrap();
+        assert_eq!(resolved.value, "abc123");
     }
 
     #[test]
@@ -769,21 +734,17 @@ mod tests {
             "#,
         );
         let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
-        let node = get(&bc.tree, "db").unwrap();
-        let interpolated = interpolate_node(node, &bc.tree).unwrap();
-        let table = interpolated.as_table().unwrap();
-
-        let mut pairs: Vec<(String, String)> = table
-            .iter()
-            .filter(|(_, v)| !v.is_table())
-            .map(|(k, v)| (k.clone(), value_to_string(v)))
-            .collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut pairs = bc.env("db", false).unwrap();
+        pairs.sort_by(|a, b| a.key.cmp(&b.key));
 
         assert_eq!(pairs.len(), 3);
-        assert!(pairs.iter().any(|(k, v)| k == "host" && v == "localhost"));
-        assert!(pairs.iter().any(|(k, v)| k == "port" && v == "5432"));
-        assert!(pairs.iter().any(|(k, v)| k == "name" && v == "mydb-dev"));
+        assert!(pairs
+            .iter()
+            .any(|p| p.key == "host" && p.value == "localhost"));
+        assert!(pairs.iter().any(|p| p.key == "port" && p.value == "5432"));
+        assert!(pairs
+            .iter()
+            .any(|p| p.key == "name" && p.value == "mydb-dev"));
     }
 
     #[test]
@@ -836,18 +797,42 @@ mod tests {
             "#,
         );
         let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
-        let node = get(&bc.tree, "app.val").unwrap();
-        let interpolated = interpolate_node(node, &bc.tree).unwrap();
-        let mut cache = SourceCache::new();
-        let (resolved, _) = resolve_provider(
-            interpolated.as_str().unwrap(),
-            &bc.providers,
-            &bc.sources,
-            &bc.merged_vars,
-            Some(&bc.config_dir),
-            &mut cache,
-        )
-        .unwrap();
-        assert_eq!(resolved, "from_source");
+        let resolved = bc.resolve("app.val", true).unwrap();
+        assert_eq!(resolved.value, "from_source");
+    }
+
+    #[test]
+    #[serial]
+    fn test_source_cache_shared_across_config_method_calls() {
+        // The source's load command produces a fresh random value each time
+        // it actually runs. If two separate top-level calls on the same
+        // Config (resolve, then env) each got their own SourceCache, the
+        // second call would see a different value.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"
+            [sources.bag]
+            load = "echo FOO=$(date +%N)"
+            [app]
+            val = "bag://FOO"
+            other = "bag://FOO"
+            "#,
+        );
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        let first = bc.resolve("app.val", true).unwrap().value;
+        let second = bc.resolve("app.other", true).unwrap().value;
+        assert_eq!(
+            first, second,
+            "two separate .resolve() calls on the same Config should share \
+             one source load, not re-run the load command each time"
+        );
+
+        let pairs = bc.env("app", true).unwrap();
+        let via_env = pairs.iter().find(|p| p.key == "val").unwrap();
+        assert_eq!(
+            via_env.value, first,
+            ".env() should reuse the same cached source load too"
+        );
     }
 }

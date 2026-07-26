@@ -2,7 +2,7 @@
 //! ports for shared infra within it, and per-worktree ports for HTTP
 //! services. Services get `band + lane + slot`, where `slot` is a small
 //! per-branch integer (0 for a primary branch, else 1..=9) handed out by
-//! [`crate::slots`] -- the lowest one not already claimed by another
+//! [`super::slots`] -- the lowest one not already claimed by another
 //! currently checked-out worktree of the same repo -- so two active
 //! branches can never collide on the same ports.
 //!
@@ -20,10 +20,10 @@
 //! ```
 //!
 //! [`resolve`] turns this into a [`ResolvedPorts`] (say the branch is
-//! assigned slot 3): `branch`, `branch_slug`, `slot`,
-//! `infra.postgres = 4300`, `services.app = 4353`, etc. [`crate::config`]
-//! mirrors those fields back into the generic config tree so confit.toml's
-//! `{ports.*}` refs resolve against them like any other value.
+//! assigned slot 3): `slug`, `slot`, `infra.postgres = 4300`,
+//! `services.app = 4353`, etc. [`super`] mirrors those fields back into the
+//! generic config tree so confit.toml's `{ports.*}` refs resolve against
+//! them like any other value.
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -36,6 +36,10 @@ use crate::error::{Error, Result};
 use crate::git::Git;
 
 const DEFAULT_PRIMARY_BRANCHES: &[&str] = &["main", "master"];
+
+/// Slugs are truncated to this length -- safe under common DNS-label
+/// (63 char) and bucket/container name limits.
+const MAX_SLUG_LEN: usize = 63;
 
 /// The declared shape of a `[ports]` table, before resolution. Deserialized
 /// directly from the raw `toml::Value` -- no manual `.get()`/`.as_*()`
@@ -56,8 +60,10 @@ struct PortsSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPorts {
     pub band: i64,
-    pub branch: String,
-    pub branch_slug: String,
+    /// The current branch, lowercased, cleaned to `[a-z0-9-]`, and
+    /// length-capped -- safe to use in a database name, bucket name, or
+    /// container name.
+    pub slug: String,
     pub slot: u8,
     pub primary_branches: Vec<String>,
     /// Fully-resolved ports (not offsets), keyed by name.
@@ -73,8 +79,8 @@ pub fn current_branch(cwd: &Path) -> Result<String> {
     Git::new(cwd).current_branch()
 }
 
-/// Lowercase, alnum-and-dash only, collapsed and trimmed — safe for DB names,
-/// bucket names, container names, etc.
+/// Lowercase, alnum-and-dash only, collapsed, trimmed, and length-capped --
+/// safe for DB names, bucket names, container names, etc.
 pub fn slugify(s: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -87,7 +93,11 @@ pub fn slugify(s: &str) -> String {
             out.push('-');
             last_dash = true;
         }
+        if out.len() >= MAX_SLUG_LEN {
+            break;
+        }
     }
+    out.truncate(MAX_SLUG_LEN);
     out.trim_end_matches('-').to_string()
 }
 
@@ -100,9 +110,9 @@ fn is_primary_branch(branch: &str, primary_branches: &[String]) -> bool {
 }
 
 /// Resolve a `[ports]` table: `infra.*` becomes `band + offset`,
-/// `services.*` becomes `band + lane + slot`, and `branch`/`branch_slug`/
-/// `slot` are added alongside `band`. `slot` comes from the ledger in
-/// [`crate::slots`], which requires `cwd` to be inside a git working tree.
+/// `services.*` becomes `band + lane + slot`, and `slug`/`slot` are added
+/// alongside `band`. `slot` comes from the ledger in [`super::slots`],
+/// which requires `cwd` to be inside a git working tree.
 pub fn resolve(ports: &Value, branch: &str, cwd: &Path) -> Result<ResolvedPorts> {
     let spec: PortsSpec = ports
         .clone()
@@ -113,7 +123,7 @@ pub fn resolve(ports: &Value, branch: &str, cwd: &Path) -> Result<ResolvedPorts>
     let slot = if is_primary_branch(branch, &spec.primary_branches) {
         0
     } else {
-        crate::slots::assign(&Git::new(cwd), branch)?
+        super::slots::assign(&Git::new(cwd), branch)?
     };
 
     let primary_branches = if spec.primary_branches.is_empty() {
@@ -127,8 +137,7 @@ pub fn resolve(ports: &Value, branch: &str, cwd: &Path) -> Result<ResolvedPorts>
 
     Ok(ResolvedPorts {
         band: spec.band,
-        branch: branch.to_string(),
-        branch_slug: slug,
+        slug,
         slot,
         primary_branches,
         infra: spec
@@ -194,7 +203,7 @@ fn host_ephemeral_range() -> Option<(u16, u16)> {
 /// Validate a [`ResolvedPorts`] against this host: within-file port
 /// collisions, privileged/out-of-range ports, ports inside the host's
 /// ephemeral range, service ports already bound, and (by reading the
-/// [`crate::slots`] ledger) two branches somehow sharing a slot -- which
+/// [`super::slots`] ledger) two branches somehow sharing a slot -- which
 /// should be structurally impossible via [`resolve`], but is worth catching
 /// if the ledger file was hand-edited or corrupted.
 pub fn check_host(resolved: &ResolvedPorts, cwd: &Path) -> Result<Vec<HostIssue>> {
@@ -288,7 +297,7 @@ pub fn check_host(resolved: &ResolvedPorts, cwd: &Path) -> Result<Vec<HostIssue>
     // Ledger integrity: resolve() hands out each slot at most once, so two
     // branches sharing a slot here means the ledger file was edited or
     // corrupted out from under confit.
-    if let Ok(ledger) = crate::slots::read(&Git::new(cwd)) {
+    if let Ok(ledger) = super::slots::read(&Git::new(cwd)) {
         let mut by_slot: std::collections::HashMap<u8, Vec<&String>> =
             std::collections::HashMap::new();
         for (b, s) in &ledger {
@@ -340,6 +349,23 @@ mod tests {
     }
 
     #[test]
+    fn test_slugify_truncates_long_branch_names() {
+        let long = "a".repeat(200);
+        let slug = slugify(&long);
+        assert_eq!(slug.len(), MAX_SLUG_LEN);
+        assert_eq!(slug, "a".repeat(MAX_SLUG_LEN));
+    }
+
+    #[test]
+    fn test_slugify_truncation_trims_trailing_dash() {
+        // 62 a's + '/' -> the '/' becomes a dash right at the cutoff.
+        let name = format!("{}/rest-of-branch-name", "a".repeat(62));
+        let slug = slugify(&name);
+        assert!(slug.len() <= MAX_SLUG_LEN);
+        assert!(!slug.ends_with('-'));
+    }
+
+    #[test]
     fn test_is_primary_branch_default() {
         assert!(is_primary_branch("main", &[]));
         assert!(is_primary_branch("master", &[]));
@@ -371,8 +397,7 @@ mod tests {
         let dir = init_repo();
         let resolved = resolve(&ports, "main", dir.path()).unwrap();
         assert_eq!(resolved.band, 4300);
-        assert_eq!(resolved.branch, "main");
-        assert_eq!(resolved.branch_slug, "main");
+        assert_eq!(resolved.slug, "main");
         assert_eq!(resolved.slot, 0);
         assert_eq!(resolved.infra["postgres"], 4300);
         assert_eq!(resolved.infra["redis"], 4301);
@@ -516,9 +541,7 @@ mod tests {
 
         let ports: Value = "band = 20000\n[services]\napp = 50".parse().unwrap();
 
-        // These two branch names hash to the same bucket under the old
-        // fnv1a-based scheme -- confirming the stateful ledger no longer
-        // cares is the whole point of this test.
+        // Two arbitrary branch names, each checked out in its own worktree.
         let mut slots = Vec::new();
         for branch in ["feature/b7", "feature/b36"] {
             let wt = tempfile::tempdir().unwrap();

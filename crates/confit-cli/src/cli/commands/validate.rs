@@ -54,15 +54,15 @@ impl Op for Validate {
         // corruption. Read-only and cheap, so there's no reason to gate it
         // behind a flag or section filter.
         if let Some(resolved) = &bc.ports {
-            let issues = confit_core::ports::check_host(resolved, &bc.config_dir)?;
+            let issues = confit_core::config::check_host(resolved, &bc.config_dir)?;
             for issue in &issues {
                 let line = format!("ports.{}: {}", issue.path, issue.message);
                 match issue.severity {
-                    confit_core::ports::Severity::Error => {
+                    confit_core::config::Severity::Error => {
                         ui::failure(&line);
                         failures += 1;
                     }
-                    confit_core::ports::Severity::Warning => ui::warning(&line),
+                    confit_core::config::Severity::Warning => ui::warning(&line),
                 }
             }
             if issues.is_empty() {

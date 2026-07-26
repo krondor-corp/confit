@@ -6,14 +6,17 @@
 //! confit.toml -- user-defined sections, resolved lazily via
 //! [`interpolate`]'s `{ref}` engine, [`shell`]'s `$(...)` engine, and
 //! [`providers`]'s `scheme://` dispatch -- and the confit-owned typed parts
-//! ([`crate::ports`]) that get parsed once and mirrored into the generic
-//! tree so both look the same to `{ref}` interpolation.
+//! ([`ports`]) that get parsed once and mirrored into the generic tree so
+//! both look the same to `{ref}` interpolation.
 
 mod interpolate;
+mod ports;
 mod providers;
 mod shell;
+mod slots;
 
 pub use interpolate::{get, interpolate_node, interpolate_value};
+pub use ports::{check_host, HostIssue, ResolvedPorts, Severity};
 pub use providers::{resolve_provider, resolve_providers, ProviderSpec, SourceCache, SourceSpec};
 pub use shell::{eval_shell, eval_shells};
 
@@ -84,7 +87,7 @@ pub struct Config {
     /// The typed, confit-owned `[ports]` section, if the file has one.
     /// `None` means there's no `[ports]` table at all -- not that it failed
     /// to parse; a malformed `[ports]` fails `Config::build` outright.
-    pub ports: Option<crate::ports::ResolvedPorts>,
+    pub ports: Option<ports::ResolvedPorts>,
     /// Sources are loaded (and their `load` command run) at most once per
     /// `Config`, the first time something actually references them --
     /// shared across every `resolve`/`env`/`validate`/... call on `&self`,
@@ -108,7 +111,7 @@ impl Config {
     /// highest: `[vars]` < profile `vars` < `CONFIT_VAR_*` < `vars`.
     ///
     /// If the file has a `[ports]` section, it's parsed and resolved here
-    /// too (see [`ports::resolve`](crate::ports::resolve)): a malformed
+    /// too (see [`ports::resolve`](ports::resolve)): a malformed
     /// `[ports]` table fails construction immediately, the same as any
     /// other structural problem.
     pub fn build(
@@ -210,8 +213,8 @@ impl Config {
         let ports_raw = raw.as_table().and_then(|t| t.get("ports")).cloned();
         let ports = match ports_raw {
             Some(v) => {
-                let branch = crate::ports::current_branch(&config_dir)?;
-                Some(crate::ports::resolve(&v, &branch, &config_dir)?)
+                let branch = ports::current_branch(&config_dir)?;
+                Some(ports::resolve(&v, &branch, &config_dir)?)
             }
             None => None,
         };
@@ -692,10 +695,8 @@ mod tests {
         let resolved = bc.ports.as_ref().unwrap();
         assert_eq!(resolved.infra["postgres"], 4300);
         assert_eq!(resolved.services["app"], 4300 + 50 + resolved.slot as i64);
-        assert_eq!(
-            resolved.branch_slug,
-            crate::ports::slugify(&resolved.branch)
-        );
+        let branch = ports::current_branch(dir.path()).unwrap();
+        assert_eq!(resolved.slug, ports::slugify(&branch));
 
         // ports.* values are ordinary refs, resolvable from elsewhere in the file.
         let resolved = bc.resolve("db.url", false).unwrap();

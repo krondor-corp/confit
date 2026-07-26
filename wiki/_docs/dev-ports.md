@@ -25,22 +25,21 @@ site = 70
 confit expands this at load time, before any of the values are used
 elsewhere, into plain values alongside `band`:
 
-- `ports.branch` -- the current git branch (`git symbolic-ref --short HEAD`)
-- `ports.branch_slug` -- the branch, lowercased and cleaned to
-  `[a-z0-9-]`, safe to use in a database name, bucket name, or container
-  name
+- `ports.slug` -- the current branch, lowercased, cleaned to `[a-z0-9-]`,
+  and length-capped, safe to use in a database name, bucket name, or
+  container name
 - `ports.slot` -- `0` on a primary branch (`main`/`master` by default),
-  else the lowest integer in `1..9` not already claimed by another
-  branch checked out in this repo right now (see below)
+  else the lowest integer in `1..9` not already claimed by another branch
+  checked out in this repo right now (see below)
 - `ports.infra.<name>` -- `band + offset`, fixed regardless of branch
 - `ports.services.<name>` -- `band + lane + slot`
 
 ### How the slot is assigned
 
-Non-primary branches don't hash to a slot -- they're handed the lowest free
-one from a small ledger confit keeps at `<git-common-dir>/confit/ports.toml`
-(inside `.git`, so it's per-clone, never committed, and shared by every
-`git worktree` of the repo). Each time confit resolves `[ports]`:
+Each branch's slot lives in a small ledger confit keeps at
+`<git-common-dir>/confit/ports.toml` (inside `.git`, so it's per-clone,
+never committed, and shared by every `git worktree` of the repo). Each time
+confit resolves `[ports]`:
 
 1. It lists every worktree currently checked out (`git worktree list`) and
    drops any ledger entry whose branch isn't one of them -- a removed or
@@ -50,20 +49,19 @@ one from a small ledger confit keeps at `<git-common-dir>/confit/ports.toml`
 3. Otherwise it takes the lowest slot not currently held by another live
    branch, records it, and returns it.
 
-This packs slots tightly (three concurrent worktrees get `1, 2, 3`; remove
-the middle one and the next new worktree reclaims `2`, not `4`) and makes
-collisions structurally impossible between branches active at the same
-time -- unlike hashing the branch name, which collides by construction once
-enough branches are live. Only 9 non-primary slots exist per repo; a 10th
-concurrently checked-out branch fails with a clear error rather than
-silently doubling up on a port.
+This packs slots tightly: three concurrent worktrees get `1, 2, 3`; remove
+the middle one and the next new worktree reclaims `2`, not `4`.
+
+> There are only 9 non-primary slots per repo. Check out a 10th branch at
+> the same time and confit tells you plainly there's no slot left, rather
+> than quietly handing out a port someone else is already using.
 
 Because these are ordinary resolved values, reference them from anywhere in
 confit.toml the same way you'd reference `{vars.*}`:
 
 ```toml
 [db]
-url = "postgres://localhost:{ports.infra.postgres}/myapp_{ports.branch_slug}"
+url = "postgres://localhost:{ports.infra.postgres}/myapp_{ports.slug}"
 
 [services.app.env]
 PORT = "{ports.services.app}"
@@ -83,8 +81,7 @@ $ confit resolve ports.infra.postgres
 
 $ confit show ports --yaml
 band: 4300
-branch: feature/widgets
-branch_slug: feature-widgets
+slug: feature-widgets
 slot: 1
 infra:
   postgres: 4300
@@ -128,13 +125,13 @@ machine you're running on -- no flag needed: two names resolving to the
 same port, privileged (`<1024`) ports, ports inside this host's OS-assigned
 ephemeral range (which risks the OS handing one out for an unrelated
 outbound connection), service ports another process already has bound, and
-ledger corruption (two branches recorded against the same slot, which
-`expand_ports` itself can't produce but a hand-edited `ports.toml` could):
+ledger corruption (two branches recorded against the same slot -- confit
+itself won't produce that, but a hand-edited `ports.toml` could):
 
 ```bash
 $ confit validate
 ✓ ports.band
-✓ ports.branch
+✓ ports.slug
 ...
 ✓ ports: no issues found on this host
 ✓ all 8 values ok

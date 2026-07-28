@@ -275,35 +275,61 @@ impl Config {
     pub fn resolve(&self, dotted_path: &str, eval_providers: bool) -> Result<Resolved> {
         let node = get(&self.tree, dotted_path)?;
         let value = interpolate_node(node, &self.tree)?;
-        let mut secrets = HashSet::new();
-        let (value, is_leaf_secret) = if eval_providers {
-            let value = eval_shells(&value, Some(&self.config_dir))?;
-            let leaf_secret = match &value {
-                Value::String(s) => self.resolve_provider(s)?.1,
-                _ => false,
+        if !eval_providers {
+            return match &value {
+                Value::Table(_) => Err(Error::Lookup(format!(
+                    "'{dotted_path}' is a section, not a value. \
+                     Use 'confit keys {dotted_path}' to list keys or \
+                     'confit show {dotted_path}' for KEY=VALUE output."
+                ))),
+                Value::Array(arr) => Ok(Resolved {
+                    value: arr
+                        .iter()
+                        .map(value_to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    secret: false,
+                }),
+                other => Ok(Resolved {
+                    value: value_to_string(other),
+                    secret: false,
+                }),
             };
-            let resolved = self.resolve_providers(&value, &mut secrets)?;
-            (resolved, leaf_secret)
-        } else {
-            (value, false)
-        };
+        }
+
+        let value = eval_shells(&value, Some(&self.config_dir))?;
         match &value {
             Value::Table(_) => Err(Error::Lookup(format!(
                 "'{dotted_path}' is a section, not a value. \
                  Use 'confit keys {dotted_path}' to list keys or \
                  'confit show {dotted_path}' for KEY=VALUE output."
             ))),
-            Value::Array(arr) => Ok(Resolved {
-                value: arr
-                    .iter()
-                    .map(value_to_string)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                secret: is_leaf_secret || !secrets.is_empty(),
-            }),
+            // A bare top-level string is exactly what resolve_provider
+            // handles -- calling resolve_providers here too would run the
+            // same provider/source a second time for one value.
+            Value::String(s) => {
+                let (resolved, secret) = self.resolve_provider(s)?;
+                Ok(Resolved {
+                    value: resolved,
+                    secret,
+                })
+            }
+            Value::Array(_) => {
+                let mut secrets = HashSet::new();
+                let resolved = self.resolve_providers(&value, &mut secrets)?;
+                let arr = resolved.as_array().unwrap();
+                Ok(Resolved {
+                    value: arr
+                        .iter()
+                        .map(value_to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    secret: !secrets.is_empty(),
+                })
+            }
             other => Ok(Resolved {
                 value: value_to_string(other),
-                secret: is_leaf_secret || !secrets.is_empty(),
+                secret: false,
             }),
         }
     }
@@ -800,6 +826,40 @@ mod tests {
         let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
         let resolved = bc.resolve("app.val", true).unwrap();
         assert_eq!(resolved.value, "from_source");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_invokes_provider_exactly_once() {
+        // resolve() used to call resolve_provider() once (to get the
+        // top-level secret flag) and then resolve_providers() again on the
+        // same string (to get the value), running the provider's command
+        // twice for one resolve(). The provider here appends to a file each
+        // time it runs, so a second invocation would show up as a second
+        // line.
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("calls.txt");
+        let path = write_config(
+            dir.path(),
+            &format!(
+                r#"
+                [providers.count]
+                cmd = "echo x >> {} && echo ran"
+                [app]
+                x = "count://thing"
+                "#,
+                counter.display()
+            ),
+        );
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        let resolved = bc.resolve("app.x", true).unwrap();
+        assert_eq!(resolved.value, "ran");
+        let calls = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "provider should run exactly once per resolve(), ran: {calls:?}"
+        );
     }
 
     #[test]

@@ -43,9 +43,12 @@ const MAX_SLUG_LEN: usize = 63;
 
 /// The declared shape of a `[ports]` table, before resolution. Deserialized
 /// directly from the raw `toml::Value` -- no manual `.get()`/`.as_*()`
-/// field-by-field poking.
+/// field-by-field poking. Unknown fields are rejected: the resolved mirror
+/// replaces the raw table in the config tree, so a silently-ignored typo
+/// (`[ports.service]`) would otherwise just vanish.
 #[derive(Debug, Deserialize)]
-struct PortsSpec {
+#[serde(deny_unknown_fields)]
+pub(super) struct PortsSpec {
     band: i64,
     #[serde(default)]
     primary_branches: Vec<String>,
@@ -55,7 +58,7 @@ struct PortsSpec {
     services: BTreeMap<String, i64>,
 }
 
-/// A `[ports]` table after [`resolve`]. `infra`/`services` hold
+/// A `[ports]` table after [`PortsSpec::resolve`]. `infra`/`services` hold
 /// fully-resolved ports here, not offsets/lanes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPorts {
@@ -65,7 +68,6 @@ pub struct ResolvedPorts {
     /// container name.
     pub slug: String,
     pub slot: u8,
-    pub primary_branches: Vec<String>,
     /// Fully-resolved ports (not offsets), keyed by name.
     #[serde(default)]
     pub infra: BTreeMap<String, i64>,
@@ -109,48 +111,53 @@ fn is_primary_branch(branch: &str, primary_branches: &[String]) -> bool {
     }
 }
 
-/// Resolve a `[ports]` table: `infra.*` becomes `band + offset`,
-/// `services.*` becomes `band + lane + slot`, and `slug`/`slot` are added
-/// alongside `band`. `slot` comes from the ledger in [`super::slots`],
-/// which requires `cwd` to be inside a git working tree.
-pub fn resolve(ports: &Value, branch: &str, cwd: &Path) -> Result<ResolvedPorts> {
-    let spec: PortsSpec = ports
-        .clone()
-        .try_into()
-        .map_err(|e| Error::Runtime(format!("[ports]: {e}")))?;
+impl PortsSpec {
+    /// Shape-validate a raw `[ports]` table. Pure -- no git, no filesystem
+    /// -- so it can run eagerly at `Config::build` while the effectful
+    /// [`PortsSpec::resolve`] stays deferred.
+    pub(super) fn parse(ports: Value) -> Result<Self> {
+        ports
+            .try_into()
+            .map_err(|e| Error::Runtime(format!("[ports]: {e}")))
+    }
 
-    let slug = slugify(branch);
-    let slot = if is_primary_branch(branch, &spec.primary_branches) {
-        0
-    } else {
-        super::slots::assign(&Git::new(cwd), branch)?
-    };
+    /// Resolve against git state: `infra.*` becomes `band + offset`,
+    /// `services.*` becomes `band + lane + slot`, and `slug`/`slot` are
+    /// derived from `branch`. `slot` comes from the ledger in
+    /// [`super::slots`], which requires `cwd` to be inside a git working
+    /// tree.
+    pub(super) fn resolve(&self, branch: &str, cwd: &Path) -> Result<ResolvedPorts> {
+        let slug = slugify(branch);
+        let slot = if is_primary_branch(branch, &self.primary_branches) {
+            0
+        } else {
+            super::slots::assign(&Git::new(cwd), branch)?
+        };
 
-    let primary_branches = if spec.primary_branches.is_empty() {
-        DEFAULT_PRIMARY_BRANCHES
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        spec.primary_branches
-    };
+        Ok(ResolvedPorts {
+            band: self.band,
+            slug,
+            slot,
+            infra: self
+                .infra
+                .iter()
+                .map(|(name, offset)| (name.clone(), self.band + offset))
+                .collect(),
+            services: self
+                .services
+                .iter()
+                .map(|(name, lane)| (name.clone(), self.band + lane + slot as i64))
+                .collect(),
+        })
+    }
+}
 
-    Ok(ResolvedPorts {
-        band: spec.band,
-        slug,
-        slot,
-        primary_branches,
-        infra: spec
-            .infra
-            .into_iter()
-            .map(|(name, offset)| (name, spec.band + offset))
-            .collect(),
-        services: spec
-            .services
-            .into_iter()
-            .map(|(name, lane)| (name, spec.band + lane + slot as i64))
-            .collect(),
-    })
+/// Parse and resolve a raw `[ports]` table in one step (test convenience;
+/// production code goes through `Config`, which parses eagerly and
+/// resolves lazily).
+#[cfg(test)]
+pub(super) fn resolve(ports: &Value, branch: &str, cwd: &Path) -> Result<ResolvedPorts> {
+    PortsSpec::parse(ports.clone())?.resolve(branch, cwd)
 }
 
 /// How serious a [`HostIssue`] is.
@@ -191,7 +198,7 @@ fn host_ephemeral_range() -> Option<(u16, u16)> {
     };
     Some((
         read("net.inet.ip.portrange.first")?,
-        read("net.inet.ip.portrange.hifirst")?,
+        read("net.inet.ip.portrange.last")?,
     ))
 }
 
@@ -275,6 +282,52 @@ pub fn check_host(resolved: &ResolvedPorts, cwd: &Path) -> Result<Vec<HostIssue>
         }
     }
 
+    // Cross-slot lane spacing: every branch's services resolve to
+    // band + lane + slot with slot in 0..=MAX_SLOT, so two lanes closer
+    // than MAX_SLOT+1 apart can land on the same port for two different
+    // branches. The current branch's resolved services all share one slot,
+    // so pairwise resolved differences equal lane differences.
+    for i in 0..service_ports.len() {
+        for j in (i + 1)..service_ports.len() {
+            let diff = (service_ports[i].1 - service_ports[j].1).abs();
+            if diff > 0 && diff <= super::slots::MAX_SLOT as i64 {
+                issues.push(HostIssue {
+                    path: service_ports[i].0.clone(),
+                    severity: Severity::Error,
+                    message: format!(
+                        "lane is only {diff} apart from ports.{}; lanes must be at least \
+                         {} apart or two branches' worktree slots can resolve to the same port",
+                        service_ports[j].0,
+                        super::slots::MAX_SLOT + 1
+                    ),
+                });
+            }
+        }
+    }
+
+    // Infra offsets inside a service's slot window collide with that
+    // service on some branch: service lane + slot sweeps lane..=lane+MAX_SLOT.
+    let slot = resolved.slot as i64;
+    for (svc_name, svc_port) in &service_ports {
+        let lane_start = svc_port - slot;
+        for (infra_name, infra_port) in &infra_ports {
+            if *infra_port != *svc_port
+                && (lane_start..=lane_start + super::slots::MAX_SLOT as i64).contains(infra_port)
+            {
+                issues.push(HostIssue {
+                    path: infra_name.clone(),
+                    severity: Severity::Error,
+                    message: format!(
+                        "fixed port {infra_port} falls inside ports.{svc_name}'s worktree-slot \
+                         window ({lane_start}-{}); a branch assigned the matching slot would \
+                         collide with it",
+                        lane_start + super::slots::MAX_SLOT as i64
+                    ),
+                });
+            }
+        }
+    }
+
     // Live bind check for services only -- infra ports are expected to
     // already be held by the container/process that owns them. A privileged
     // port fails to bind as non-root regardless of whether it's free, so
@@ -294,32 +347,40 @@ pub fn check_host(resolved: &ResolvedPorts, cwd: &Path) -> Result<Vec<HostIssue>
         }
     }
 
-    // Ledger integrity: resolve() hands out each slot at most once, so two
-    // branches sharing a slot here means the ledger file was edited or
-    // corrupted out from under confit.
-    if let Ok(ledger) = super::slots::read(&Git::new(cwd)) {
-        let mut by_slot: std::collections::HashMap<u8, Vec<&String>> =
-            std::collections::HashMap::new();
-        for (b, s) in &ledger {
-            by_slot.entry(*s).or_default().push(b);
-        }
-        for (slot, branches) in by_slot {
-            if branches.len() > 1 {
-                issues.push(HostIssue {
-                    path: "slot".into(),
-                    severity: Severity::Error,
-                    message: format!(
-                        "slot {slot} is claimed by multiple branches in the local ledger \
-                         (.git/confit/ports.toml): {} -- delete the stale entry and re-run",
-                        branches
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                });
+    // Ledger integrity: assignment hands out each slot at most once, so two
+    // branches sharing a slot here means the ledger file was edited out
+    // from under confit. An unreadable/unparseable ledger is itself an
+    // issue, not something to skip silently.
+    match super::slots::read(&Git::new(cwd)) {
+        Ok(ledger) => {
+            let mut by_slot: std::collections::HashMap<u8, Vec<&String>> =
+                std::collections::HashMap::new();
+            for (b, s) in &ledger {
+                by_slot.entry(*s).or_default().push(b);
+            }
+            for (slot, branches) in by_slot {
+                if branches.len() > 1 {
+                    issues.push(HostIssue {
+                        path: "slot".into(),
+                        severity: Severity::Error,
+                        message: format!(
+                            "slot {slot} is claimed by multiple branches in the local ledger \
+                             (.git/confit/ports.toml): {} -- delete the stale entry and re-run",
+                            branches
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
             }
         }
+        Err(e) => issues.push(HostIssue {
+            path: "slot".into(),
+            severity: Severity::Error,
+            message: e.to_string(),
+        }),
     }
 
     Ok(issues)
@@ -328,17 +389,7 @@ pub fn check_host(resolved: &ResolvedPorts, cwd: &Path) -> Result<Vec<HostIssue>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
-        dir
-    }
+    use crate::testutil::init_repo;
 
     #[test]
     fn test_slugify_basic() {
@@ -433,10 +484,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_persists_primary_branches() {
-        let ports: Value = "band = 4300".parse().unwrap();
-        let resolved = resolve(&ports, "main", Path::new(".")).unwrap();
-        assert_eq!(resolved.primary_branches, vec!["main", "master"]);
+    fn test_parse_rejects_unknown_fields() {
+        // A typo'd sub-table must fail loudly: the resolved mirror replaces
+        // the raw table, so an ignored unknown field would silently vanish.
+        let ports: Value = "band = 4300\n[service]\napp = 50".parse().unwrap();
+        let err = PortsSpec::parse(ports).unwrap_err().to_string();
+        assert!(err.contains("service"), "got: {err}");
     }
 
     #[test]
@@ -574,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn test_check_host_detects_corrupted_ledger() {
+    fn test_check_host_detects_duplicate_slot_in_ledger() {
         let dir = init_repo();
         let git = Git::new(dir.path());
         let ledger_path = git.common_dir().unwrap().join("confit").join("ports.toml");
@@ -590,5 +643,60 @@ mod tests {
             .iter()
             .any(|i| i.severity == Severity::Error
                 && i.message.contains("claimed by multiple branches")));
+    }
+
+    #[test]
+    fn test_check_host_surfaces_unparseable_ledger() {
+        let dir = init_repo();
+        let git = Git::new(dir.path());
+        let ledger_path = git.common_dir().unwrap().join("confit").join("ports.toml");
+        std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+        std::fs::write(&ledger_path, "not toml [[[").unwrap();
+
+        let ports: Value = "band = 20000\n[services]\napp = 50".parse().unwrap();
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("corrupted")),
+            "got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_host_flags_lanes_closer_than_slot_range() {
+        // app=50 and site=55: slot 1's site (band+56) equals slot 6's app
+        // (band+56) on another branch, so lanes <10 apart are an error.
+        let ports: Value = "band = 20000\n[services]\napp = 50\nsite = 55"
+            .parse()
+            .unwrap();
+        let dir = init_repo();
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("lanes must be")),
+            "got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_host_flags_infra_inside_service_slot_window() {
+        // infra web=52 sits in service app's slot window [50, 59]: the
+        // branch assigned slot 2 would resolve app to the same port.
+        let ports: Value = "band = 20000\n[infra]\nweb = 52\n[services]\napp = 50"
+            .parse()
+            .unwrap();
+        let dir = init_repo();
+        let resolved = resolve(&ports, "main", dir.path()).unwrap();
+        let issues = check_host(&resolved, dir.path()).unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("slot window")),
+            "got: {issues:?}"
+        );
     }
 }

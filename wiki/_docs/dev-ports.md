@@ -99,6 +99,13 @@ at a glance -- keep a short registry of "which project claimed which base"
 somewhere shared (a wiki page, a top comment in each project's
 `confit.toml`).
 
+## Spacing lanes
+
+A service's port sweeps `lane` through `lane + 9` as branches come and go,
+so lanes must sit at least 10 apart from each other (and from any fixed
+infra offset) or two branches can land on the same port. `confit validate`
+errors when a `[ports]` layout breaks this.
+
 ## Primary branches
 
 By default `main` and `master` get slot `0`. Override with
@@ -112,21 +119,24 @@ primary_branches = ["trunk"]
 
 ## Requirements
 
-`[ports]` requires running inside a git working tree (confit shells out to
-`git` to read the current branch, list worktrees, and read/write the slot
-ledger) and an integer `band`. `ports.infra.*` values must be integer
-offsets; `ports.services.*` values must be integer lanes.
+`[ports]` needs an integer `band`; `ports.infra.*` values must be integer
+offsets and `ports.services.*` values integer lanes -- all checked when the
+config loads. Actually resolving ports (a `{ports.*}` ref, `confit resolve
+ports...`, `confit validate`) additionally requires a git working tree with
+a branch checked out: confit shells out to `git` to read the current
+branch, list worktrees, and read/write the slot ledger. Commands that never
+touch ports work fine without git.
 
 ## Checking a band against this host
 
 Whenever a `[ports]` section is in scope, `confit validate` (and
 `confit validate ports`) also checks the resolved values against the
 machine you're running on -- no flag needed: two names resolving to the
-same port, privileged (`<1024`) ports, ports inside this host's OS-assigned
-ephemeral range (which risks the OS handing one out for an unrelated
-outbound connection), service ports another process already has bound, and
-ledger corruption (two branches recorded against the same slot -- confit
-itself won't produce that, but a hand-edited `ports.toml` could):
+same port, lanes closer than 10 apart, privileged (`<1024`) ports, ports
+inside this host's OS-assigned ephemeral range (which risks the OS handing
+one out for an unrelated outbound connection), service ports another
+process already has bound, and a corrupted or hand-edited slot ledger.
+Scoping validation elsewhere (`confit validate db`) skips the ports check:
 
 ```bash
 $ confit validate

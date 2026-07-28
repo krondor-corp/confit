@@ -8,14 +8,11 @@
 //! Slots are handed out lowest-first and any branch no longer checked out
 //! anywhere is proactively pruned before each assignment, so two branches
 //! that happen to be active at the same time can never be handed the same
-//! slot (unlike hashing the branch name, which collides by construction
-//! once enough branches are live).
+//! slot.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::git::Git;
@@ -30,92 +27,60 @@ fn state_path(git: &Git) -> Result<PathBuf> {
     Ok(git.common_dir()?.join("confit").join("ports.toml"))
 }
 
-/// A crude but sufficient mutual-exclusion lock: exclusive-create a sibling
-/// `.lock` file, retrying briefly; a lock older than the deadline is assumed
-/// stale (its owner crashed) and stolen.
-struct FileLock {
-    path: PathBuf,
+/// Take an exclusive advisory lock (`flock`) on a sibling `.lock` file.
+/// The lock is tied to the open file descriptor, so it's released
+/// automatically when the guard drops -- including on process death, which
+/// makes it safe against a crashed holder without any staleness heuristics.
+/// The lock file itself is left in place; only the lock matters, not the
+/// file's existence.
+fn open_lock(ledger_path: &Path) -> Result<fd_lock::RwLock<fs::File>> {
+    let lock_path = ledger_path.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| Error::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| Error::Io {
+            path: lock_path.clone(),
+            source: e,
+        })?;
+    Ok(fd_lock::RwLock::new(file))
 }
 
-impl FileLock {
-    fn acquire(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| Error::Io {
-                path: parent.to_path_buf(),
+fn corrupt<E: std::fmt::Display>(path: &Path) -> impl Fn(E) -> Error + '_ {
+    move |e| {
+        Error::Runtime(format!(
+            "port-slot ledger {} is corrupted ({e}); fix or delete it and re-run",
+            path.display()
+        ))
+    }
+}
+
+/// Read the ledger. A missing file is an empty ledger; an unreadable or
+/// unparseable one is an error -- never silently treated as empty, since
+/// that would re-deal slots already owned by live worktrees.
+fn load(path: &Path) -> Result<BTreeMap<String, u8>> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(Error::Io {
+                path: path.to_path_buf(),
                 source: e,
-            })?;
+            })
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(_) => {
-                    return Ok(FileLock {
-                        path: path.to_path_buf(),
-                    })
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if Instant::now() > deadline {
-                        let _ = fs::remove_file(path);
-                        continue;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => {
-                    return Err(Error::Io {
-                        path: path.to_path_buf(),
-                        source: e,
-                    })
-                }
-            }
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Escape a branch name as a TOML basic string.
-fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn load(path: &Path) -> BTreeMap<String, u8> {
-    let Ok(content) = fs::read_to_string(path) else {
-        return BTreeMap::new();
     };
-    let Ok(parsed) = content.parse::<toml::Value>() else {
-        return BTreeMap::new();
-    };
-    let Some(table) = parsed.as_table() else {
-        return BTreeMap::new();
-    };
-    table
-        .iter()
-        .filter_map(|(k, v)| {
-            v.as_integer()
-                .and_then(|n| u8::try_from(n).ok())
-                .map(|n| (k.clone(), n))
-        })
-        .collect()
+    content
+        .parse::<toml::Value>()
+        .map_err(corrupt(path))?
+        .try_into()
+        .map_err(corrupt(path))
 }
 
 fn save(path: &Path, slots: &BTreeMap<String, u8>) -> Result<()> {
@@ -125,10 +90,8 @@ fn save(path: &Path, slots: &BTreeMap<String, u8>) -> Result<()> {
             source: e,
         })?;
     }
-    let mut out = String::new();
-    for (branch, slot) in slots {
-        out.push_str(&format!("{} = {slot}\n", quote(branch)));
-    }
+    let out = toml::to_string(slots)
+        .map_err(|e| Error::Runtime(format!("serializing port-slot ledger: {e}")))?;
     fs::write(path, out).map_err(|e| Error::Io {
         path: path.to_path_buf(),
         source: e,
@@ -138,99 +101,64 @@ fn save(path: &Path, slots: &BTreeMap<String, u8>) -> Result<()> {
 /// Look up (or assign) `branch`'s slot in `1..=MAX_SLOT`, reusing its
 /// existing assignment if it already has one. Proactively prunes any branch
 /// no longer checked out in any worktree of this repo first, so slots pack
-/// as tightly as possible.
+/// as tightly as possible. The ledger is only rewritten when it actually
+/// changed.
 pub fn assign(git: &Git, branch: &str) -> Result<u8> {
     let path = state_path(git)?;
-    let _lock = FileLock::acquire(&path.with_extension("lock"))?;
+    let mut lock = open_lock(&path)?;
+    let _guard = lock.write().map_err(|e| Error::Io {
+        path: path.with_extension("lock"),
+        source: e,
+    })?;
 
-    let mut slots = load(&path);
+    let mut slots = load(&path)?;
 
     let live: HashSet<String> = git
         .worktrees()?
         .into_iter()
         .filter_map(|w| w.branch)
         .collect();
+    let before = slots.len();
     slots.retain(|b, _| live.contains(b) || b == branch);
+    let mut changed = slots.len() != before;
 
-    if let Some(&slot) = slots.get(branch) {
+    let slot = match slots.get(branch) {
+        Some(&slot) => slot,
+        None => {
+            let used: HashSet<u8> = slots.values().copied().collect();
+            let slot = (1..=MAX_SLOT).find(|s| !used.contains(s)).ok_or_else(|| {
+                Error::Runtime(format!(
+                    "no free port slot for branch '{branch}': all {MAX_SLOT} slots are claimed by \
+                     other active worktrees of this repo (`git worktree list` to see them, \
+                     `git worktree remove` to free one up)"
+                ))
+            })?;
+            slots.insert(branch.to_string(), slot);
+            changed = true;
+            slot
+        }
+    };
+
+    if changed {
         save(&path, &slots)?;
-        return Ok(slot);
     }
-
-    let used: HashSet<u8> = slots.values().copied().collect();
-    let slot = (1..=MAX_SLOT).find(|s| !used.contains(s)).ok_or_else(|| {
-        Error::Runtime(format!(
-            "no free port slot for branch '{branch}': all {MAX_SLOT} slots are claimed by \
-             other active worktrees of this repo (`git worktree list` to see them, \
-             `git worktree remove` to free one up)"
-        ))
-    })?;
-
-    slots.insert(branch.to_string(), slot);
-    save(&path, &slots)?;
     Ok(slot)
 }
 
 /// Read the ledger without mutating it (diagnostics / integrity checks).
+/// Propagates corruption as an error rather than an empty map.
 pub fn read(git: &Git) -> Result<BTreeMap<String, u8>> {
-    Ok(load(&state_path(git)?))
+    load(&state_path(git)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
-        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args([
-                "-c",
-                "user.email=t@t.com",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-q",
-                "-m",
-                "init",
-            ])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-        dir
-    }
-
-    fn add_worktree(main: &Path, wt_path: &Path, branch: &str) {
-        assert!(Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                branch,
-                wt_path.to_str().unwrap(),
-            ])
-            .current_dir(main)
-            .status()
-            .unwrap()
-            .success());
-    }
+    use crate::testutil::{add_worktree, init_repo_with_commit};
 
     #[test]
     fn test_assign_lowest_free_slot() {
-        let dir = init_repo();
+        let dir = init_repo_with_commit();
         let git = Git::new(dir.path());
 
         let wt_a = tempfile::tempdir().unwrap();
@@ -248,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_assign_reclaims_pruned_slot() {
-        let dir = init_repo();
+        let dir = init_repo_with_commit();
         let git = Git::new(dir.path());
 
         let wt_a = tempfile::tempdir().unwrap();
@@ -257,7 +185,7 @@ mod tests {
         assert_eq!(assign(&git, "feature/a").unwrap(), 1);
 
         // Remove the worktree -- feature/a is no longer checked out anywhere.
-        assert!(Command::new("git")
+        assert!(std::process::Command::new("git")
             .args(["worktree", "remove", "-f", wt_a_path.to_str().unwrap()])
             .current_dir(dir.path())
             .status()
@@ -272,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_assign_exhaustion_errors() {
-        let dir = init_repo();
+        let dir = init_repo_with_commit();
         let git = Git::new(dir.path());
 
         for i in 0..MAX_SLOT {
@@ -295,5 +223,56 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no free port slot"));
+    }
+
+    #[test]
+    fn test_corrupted_ledger_errors_instead_of_resetting() {
+        let dir = init_repo_with_commit();
+        let git = Git::new(dir.path());
+        let path = state_path(&git).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not valid toml [[[").unwrap();
+
+        let read_err = read(&git).unwrap_err().to_string();
+        assert!(read_err.contains("corrupted"), "got: {read_err}");
+
+        let wt = tempfile::tempdir().unwrap();
+        add_worktree(dir.path(), wt.path().join("wt").as_path(), "feature/a");
+        let assign_err = assign(&git, "feature/a").unwrap_err().to_string();
+        assert!(assign_err.contains("corrupted"), "got: {assign_err}");
+        // The corrupted file must not have been overwritten.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not valid toml [[[");
+    }
+
+    #[test]
+    fn test_noop_assign_does_not_rewrite_ledger() {
+        let dir = init_repo_with_commit();
+        let git = Git::new(dir.path());
+
+        let wt = tempfile::tempdir().unwrap();
+        add_worktree(dir.path(), wt.path().join("wt").as_path(), "feature/a");
+        assert_eq!(assign(&git, "feature/a").unwrap(), 1);
+
+        let path = state_path(&git).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Same branch, nothing pruned: the file must not be rewritten.
+        assert_eq!(assign(&git, "feature/a").unwrap(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn test_branch_names_with_special_chars_round_trip() {
+        let dir = init_repo_with_commit();
+        let git = Git::new(dir.path());
+
+        // Quotes and non-ASCII are legal in git branch names; the ledger
+        // must round-trip them without corrupting itself.
+        let branch = "feature/we\"ird-tëst";
+        let wt = tempfile::tempdir().unwrap();
+        add_worktree(dir.path(), wt.path().join("wt").as_path(), branch);
+        let slot = assign(&git, branch).unwrap();
+        assert_eq!(read(&git).unwrap().get(branch), Some(&slot));
+        assert_eq!(assign(&git, branch).unwrap(), slot);
     }
 }

@@ -11,7 +11,7 @@ use toml::Value;
 use crate::error::{Error, Result};
 
 pub(crate) static REF_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{([a-zA-Z0-9_.]+)\}").unwrap());
+    LazyLock::new(|| Regex::new(r"\{([a-zA-Z0-9_.-]+)\}").unwrap());
 
 pub fn get<'a>(config: &'a Value, dotted_path: &str) -> Result<&'a Value> {
     let parts: Vec<&str> = dotted_path.split('.').collect();
@@ -25,10 +25,9 @@ pub fn get<'a>(config: &'a Value, dotted_path: &str) -> Result<&'a Value> {
                 if parts[0] == "vars" {
                     let var_name = parts[1..].join(".");
                     return Err(Error::Lookup(format!(
-                        "Variable '{var_name}' is not set. \
-                         Define it in [vars] in confit.toml, \
-                         pass --set {var_name}=VALUE, \
-                         or set CONFIT_VAR_{}",
+                        "Variable '{var_name}' is not declared. \
+                         Add it to [vars] in confit.toml (a default or \"\"), \
+                         then override with --set {var_name}=VALUE or CONFIT_VAR_{}",
                         var_name.to_uppercase()
                     )));
                 }

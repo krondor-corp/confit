@@ -7,7 +7,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -39,8 +38,12 @@ fn resolve_file(path_str: &str, cwd: Option<&Path>) -> Result<String> {
     Ok(content.trim().to_string())
 }
 
+/// Substitute `{key}` refs in a command template. `extras` (checked first)
+/// carries per-call values like `uri`/`path` without cloning the whole vars
+/// map; a bare `{vars.x}` spelling falls back to `x` in `vars`.
 fn expand_template(
     template: &str,
+    extras: &[(&str, &str)],
     vars: &HashMap<String, String>,
     scheme: &str,
     uri: &str,
@@ -51,12 +54,23 @@ fn expand_template(
         let m = cap.get(0).unwrap();
         result.push_str(&template[last..m.start()]);
         let key = &cap[1];
-        match vars.get(key) {
+        let value = extras
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
+            .or_else(|| vars.get(key).map(String::as_str))
+            .or_else(|| {
+                key.strip_prefix("vars.")
+                    .and_then(|bare| vars.get(bare))
+                    .map(String::as_str)
+            });
+        match value {
             Some(val) => result.push_str(val),
             None => {
                 return Err(Error::Runtime(format!(
-                    "Provider '{scheme}' requires '{{{key}}}' but it was not set \
-                     (resolving '{uri}'). Pass --set {key}=VALUE or set CONFIT_VAR_{}",
+                    "Provider '{scheme}' requires '{{{key}}}' but it is not declared \
+                     (resolving '{uri}'). Add {key} to [vars] in confit.toml, then \
+                     override with --set {key}=VALUE or CONFIT_VAR_{}",
                     key.to_uppercase()
                 )));
             }
@@ -65,15 +79,6 @@ fn expand_template(
     }
     result.push_str(&template[last..]);
     Ok(result)
-}
-
-fn run_shell(cmd: &str, cwd: Option<&Path>) -> std::io::Result<std::process::Output> {
-    let mut command = Command::new("sh");
-    command.args(["-c", cmd]);
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    command.output()
 }
 
 /// `[providers.<scheme>]`: resolves `scheme://path` by running `cmd` with
@@ -102,13 +107,11 @@ impl ProviderSpec {
         vars: &HashMap<String, String>,
         cwd: Option<&Path>,
     ) -> Result<String> {
-        let mut template_vars = vars.clone();
-        template_vars.insert("uri".into(), uri.into());
-        template_vars.insert("path".into(), path.into());
-        let cmd = expand_template(self.cmd_template(), &template_vars, scheme, uri)?;
+        let extras = [("uri", uri), ("path", path)];
+        let cmd = expand_template(self.cmd_template(), &extras, vars, scheme, uri)?;
 
-        let output =
-            run_shell(&cmd, cwd).map_err(|e| Error::Runtime(format!("Provider {scheme}: {e}")))?;
+        let output = super::shell::run_shell(&cmd, cwd)
+            .map_err(|e| Error::Runtime(format!("Provider {scheme}: {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::Runtime(format!(
@@ -169,15 +172,10 @@ impl SourceSpec {
             }
         }
 
-        // Support both {stage} and {vars.stage} in source load templates.
-        let template_vars: HashMap<String, String> = vars
-            .iter()
-            .flat_map(|(k, v)| [(k.clone(), v.clone()), (format!("vars.{k}"), v.clone())])
-            .collect();
+        // expand_template already accepts both {stage} and {vars.stage}.
+        let cmd = expand_template(template, &[], vars, name, name)?;
 
-        let cmd = expand_template(template, &template_vars, name, name)?;
-
-        let output = run_shell(&cmd, cwd)
+        let output = super::shell::run_shell(&cmd, cwd)
             .map_err(|e| Error::Runtime(format!("Source '{name}' load failed: {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -649,15 +647,21 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("path".into(), "secret/key".into());
         vars.insert("stage".into(), "prod".into());
-        let result =
-            expand_template("fetch {stage} {path}", &vars, "vault", "vault://secret/key").unwrap();
+        let result = expand_template(
+            "fetch {stage} {path}",
+            &[("path", "secret/key")],
+            &vars,
+            "vault",
+            "vault://secret/key",
+        )
+        .unwrap();
         assert_eq!(result, "fetch prod secret/key");
     }
 
     #[test]
     fn test_expand_template_missing_var() {
         let vars = HashMap::new();
-        let result = expand_template("fetch {missing}", &vars, "vault", "vault://x");
+        let result = expand_template("fetch {missing}", &[], &vars, "vault", "vault://x");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("missing"));
     }

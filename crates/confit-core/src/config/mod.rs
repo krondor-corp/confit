@@ -15,12 +15,14 @@ mod providers;
 mod shell;
 mod slots;
 
-pub use interpolate::{get, interpolate_node, interpolate_value};
 pub use ports::{check_host, HostIssue, ResolvedPorts, Severity};
-pub use providers::{resolve_provider, resolve_providers, ProviderSpec, SourceCache, SourceSpec};
-pub use shell::{eval_shell, eval_shells};
+pub use providers::{ProviderSpec, SourceSpec};
 
-use std::cell::RefCell;
+use interpolate::{get, interpolate_node, interpolate_value, value_to_string};
+use providers::{resolve_provider, resolve_providers, SourceCache};
+use shell::{eval_shell, eval_shells};
+
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -30,12 +32,10 @@ use toml::Value;
 use crate::error::{Error, Result};
 use crate::yaml;
 
-use interpolate::value_to_string;
-
 const CONFIG_FILENAME: &str = "confit.toml";
 const VAR_ENV_PREFIX: &str = "CONFIT_VAR_";
 
-pub fn find_config() -> Result<PathBuf> {
+fn find_config() -> Result<PathBuf> {
     let cwd = std::env::current_dir().map_err(|e| Error::Io {
         path: PathBuf::from("."),
         source: e,
@@ -53,7 +53,7 @@ pub fn find_config() -> Result<PathBuf> {
     }
 }
 
-pub fn load_raw(path: &Path) -> Result<Value> {
+fn load_raw(path: &Path) -> Result<Value> {
     let content = std::fs::read_to_string(path).map_err(|e| Error::Io {
         path: path.to_path_buf(),
         source: e,
@@ -61,7 +61,7 @@ pub fn load_raw(path: &Path) -> Result<Value> {
     Ok(content.parse::<Value>()?)
 }
 
-pub fn collect_env_vars() -> HashMap<String, String> {
+fn collect_env_vars() -> HashMap<String, String> {
     let mut result = HashMap::new();
     for (k, v) in std::env::vars() {
         if let Some(name) = k.strip_prefix(VAR_ENV_PREFIX) {
@@ -77,22 +77,43 @@ pub fn collect_env_vars() -> HashMap<String, String> {
 pub struct Config {
     /// The generic, arbitrary-shaped part of confit.toml -- user-defined
     /// sections, resolved lazily per path via `{ref}`/`$(...)`/`scheme://`.
-    /// `[ports]`'s resolved values are mirrored in here too (as plain
-    /// literals) so `{ports.*}` refs work exactly like any other value.
-    pub tree: Value,
+    /// The raw `[ports]` section is removed from here at build; its
+    /// resolved mirror lives in `ports_tree` and is materialized on demand.
+    tree: Value,
     pub providers: HashMap<String, ProviderSpec>,
     pub sources: HashMap<String, SourceSpec>,
     pub merged_vars: HashMap<String, String>,
     pub config_dir: PathBuf,
-    /// The typed, confit-owned `[ports]` section, if the file has one.
-    /// `None` means there's no `[ports]` table at all -- not that it failed
-    /// to parse; a malformed `[ports]` fails `Config::build` outright.
-    pub ports: Option<ports::ResolvedPorts>,
+    /// The shape-validated `[ports]` declaration, if the file has one.
+    /// Parsing is eager (a malformed `[ports]` fails `Config::build`), but
+    /// the effectful part -- reading the git branch and assigning a slot in
+    /// the ledger -- is deferred to [`Config::ports`] so commands that
+    /// never touch ports never spawn git or write the ledger.
+    ports_spec: Option<ports::PortsSpec>,
+    /// Lazily-resolved `[ports]` values; populated at most once.
+    ports: OnceCell<ports::ResolvedPorts>,
+    /// `tree` plus the resolved ports mirror, so `{ports.*}` refs resolve
+    /// like any other value. Materialized on first use that needs it.
+    ports_tree: OnceCell<Value>,
+    /// Whether any string in the file mentions `{ports.` -- when false,
+    /// interpolation can never reach ports, so operations on other sections
+    /// skip ports resolution entirely.
+    refs_ports: bool,
     /// Sources are loaded (and their `load` command run) at most once per
     /// `Config`, the first time something actually references them --
     /// shared across every `resolve`/`env`/`validate`/... call on `&self`,
     /// not recreated per call.
     source_cache: RefCell<SourceCache>,
+}
+
+/// Whether any string anywhere in `node` contains the literal `{ports.`.
+fn mentions_ports(node: &Value) -> bool {
+    match node {
+        Value::String(s) => s.contains("{ports."),
+        Value::Table(map) => map.values().any(mentions_ports),
+        Value::Array(arr) => arr.iter().any(mentions_ports),
+        _ => false,
+    }
 }
 
 impl Config {
@@ -110,10 +131,10 @@ impl Config {
     /// without requiring `--set` at the call site. Precedence, lowest to
     /// highest: `[vars]` < profile `vars` < `CONFIT_VAR_*` < `vars`.
     ///
-    /// If the file has a `[ports]` section, it's parsed and resolved here
-    /// too (see [`ports::resolve`](ports::resolve)): a malformed
-    /// `[ports]` table fails construction immediately, the same as any
-    /// other structural problem.
+    /// If the file has a `[ports]` section, its shape is validated here (a
+    /// malformed `[ports]` table fails construction immediately, the same
+    /// as any other structural problem), but the git/ledger work of
+    /// resolving it is deferred until something actually uses ports.
     pub fn build(
         path: Option<&Path>,
         vars: &HashMap<String, String>,
@@ -141,6 +162,16 @@ impl Config {
                     .map_err(|e| Error::Runtime(format!("[sources]: {e}")))?,
                 None => HashMap::new(),
             };
+            // `env` is the built-in process-environment source and always
+            // wins the scheme lookup; a user-defined one would silently
+            // never run, so reject it outright.
+            if sources.contains_key("env") {
+                return Err(Error::Runtime(
+                    "[sources.env] collides with the built-in env:// source \
+                     (which reads the process environment); pick another name"
+                        .into(),
+                ));
+            }
             (providers, sources)
         };
 
@@ -207,29 +238,22 @@ impl Config {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
-        // Resolve [ports] (if present) before the vars/ports tables are
-        // written back, so this reads the user-declared `infra`/`services`
-        // offsets, not anything already-resolved.
-        let ports_raw = raw.as_table().and_then(|t| t.get("ports")).cloned();
-        let ports = match ports_raw {
-            Some(v) => {
-                let branch = ports::current_branch(&config_dir)?;
-                Some(ports::resolve(&v, &branch, &config_dir)?)
-            }
+        // Shape-validate [ports] now (pure); defer the git/ledger work.
+        // The raw table is removed from the tree -- its offsets/lanes must
+        // never be readable where resolved ports are expected.
+        let table = raw.as_table_mut().unwrap();
+        let ports_spec = match table.remove("ports") {
+            Some(v) => Some(ports::PortsSpec::parse(v)?),
             None => None,
         };
 
-        let table = raw.as_table_mut().unwrap();
         let vars_table: Map<String, Value> = merged_vars
             .iter()
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
             .collect();
         table.insert("vars".into(), Value::Table(vars_table));
-        if let Some(resolved) = &ports {
-            let ports_tree =
-                Value::try_from(resolved).map_err(|e| Error::Runtime(format!("[ports]: {e}")))?;
-            table.insert("ports".into(), ports_tree);
-        }
+
+        let refs_ports = mentions_ports(&raw);
 
         Ok(Config {
             tree: raw,
@@ -237,9 +261,58 @@ impl Config {
             sources,
             merged_vars,
             config_dir,
-            ports,
+            ports_spec,
+            ports: OnceCell::new(),
+            ports_tree: OnceCell::new(),
+            refs_ports,
             source_cache: RefCell::new(SourceCache::new()),
         })
+    }
+
+    /// The resolved `[ports]` section, or `None` if the file has none.
+    ///
+    /// The first call reads the current git branch and (on a non-primary
+    /// branch) assigns a slot in the ledger; later calls return the cached
+    /// result. This is where "must be inside a git working tree" applies --
+    /// not `Config::build`.
+    pub fn ports(&self) -> Result<Option<&ports::ResolvedPorts>> {
+        let Some(spec) = &self.ports_spec else {
+            return Ok(None);
+        };
+        if let Some(resolved) = self.ports.get() {
+            return Ok(Some(resolved));
+        }
+        let branch = ports::current_branch(&self.config_dir)?;
+        let resolved = spec.resolve(&branch, &self.config_dir)?;
+        Ok(Some(self.ports.get_or_init(|| resolved)))
+    }
+
+    /// The tree to resolve `target` against. Ports are materialized into it
+    /// only when they can actually matter: the target is under `ports`, or
+    /// some string in the file references `{ports.`. Everything else reads
+    /// the plain tree and never triggers git/ledger work.
+    fn tree_for(&self, target: &str) -> Result<&Value> {
+        let needs_ports = self.ports_spec.is_some()
+            && (self.refs_ports || target == "ports" || target.starts_with("ports."));
+        if !needs_ports {
+            return Ok(&self.tree);
+        }
+        if let Some(tree) = self.ports_tree.get() {
+            return Ok(tree);
+        }
+        let resolved = self.ports()?.expect("ports_spec is present");
+        let mirror =
+            Value::try_from(resolved).map_err(|e| Error::Runtime(format!("[ports]: {e}")))?;
+        let mut tree = self.tree.clone();
+        tree.as_table_mut().unwrap().insert("ports".into(), mirror);
+        Ok(self.ports_tree.get_or_init(|| tree))
+    }
+
+    /// Like [`Config::tree_for`] for whole-tree operations (`load`,
+    /// `validate`): if the file declares `[ports]` at all, the mirror is
+    /// included.
+    fn full_tree(&self) -> Result<&Value> {
+        self.tree_for("ports")
     }
 
     /// Resolve one `scheme://...` (or plain) value against this config's
@@ -273,37 +346,25 @@ impl Config {
     }
 
     pub fn resolve(&self, dotted_path: &str, eval_providers: bool) -> Result<Resolved> {
-        let node = get(&self.tree, dotted_path)?;
-        let value = interpolate_node(node, &self.tree)?;
+        let tree = self.tree_for(dotted_path)?;
+        let node = get(tree, dotted_path)?;
+        let value = interpolate_node(node, tree)?;
+        if value.is_table() {
+            return Err(Error::Lookup(format!(
+                "'{dotted_path}' is a section, not a value. \
+                 Use 'confit keys {dotted_path}' to list keys or \
+                 'confit show {dotted_path}' for KEY=VALUE output."
+            )));
+        }
         if !eval_providers {
-            return match &value {
-                Value::Table(_) => Err(Error::Lookup(format!(
-                    "'{dotted_path}' is a section, not a value. \
-                     Use 'confit keys {dotted_path}' to list keys or \
-                     'confit show {dotted_path}' for KEY=VALUE output."
-                ))),
-                Value::Array(arr) => Ok(Resolved {
-                    value: arr
-                        .iter()
-                        .map(value_to_string)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    secret: false,
-                }),
-                other => Ok(Resolved {
-                    value: value_to_string(other),
-                    secret: false,
-                }),
-            };
+            return Ok(Resolved {
+                value: value_to_string(&value),
+                secret: false,
+            });
         }
 
         let value = eval_shells(&value, Some(&self.config_dir))?;
         match &value {
-            Value::Table(_) => Err(Error::Lookup(format!(
-                "'{dotted_path}' is a section, not a value. \
-                 Use 'confit keys {dotted_path}' to list keys or \
-                 'confit show {dotted_path}' for KEY=VALUE output."
-            ))),
             // A bare top-level string is exactly what resolve_provider
             // handles -- calling resolve_providers here too would run the
             // same provider/source a second time for one value.
@@ -317,13 +378,8 @@ impl Config {
             Value::Array(_) => {
                 let mut secrets = HashSet::new();
                 let resolved = self.resolve_providers(&value, &mut secrets)?;
-                let arr = resolved.as_array().unwrap();
                 Ok(Resolved {
-                    value: arr
-                        .iter()
-                        .map(value_to_string)
-                        .collect::<Vec<_>>()
-                        .join(" "),
+                    value: value_to_string(&resolved),
                     secret: !secrets.is_empty(),
                 })
             }
@@ -335,7 +391,7 @@ impl Config {
     }
 
     pub fn keys(&self, dotted_path: &str) -> Result<Vec<String>> {
-        let node = get(&self.tree, dotted_path)?;
+        let node = get(self.tree_for(dotted_path)?, dotted_path)?;
         match node.as_table() {
             Some(table) => Ok(table.keys().cloned().collect()),
             None => Err(Error::Lookup(format!("'{dotted_path}' is not a section"))),
@@ -343,8 +399,9 @@ impl Config {
     }
 
     pub fn env(&self, dotted_path: &str, eval_providers: bool) -> Result<Vec<EnvPair>> {
-        let node = get(&self.tree, dotted_path)?;
-        let interpolated = interpolate_node(node, &self.tree)?;
+        let tree = self.tree_for(dotted_path)?;
+        let node = get(tree, dotted_path)?;
+        let interpolated = interpolate_node(node, tree)?;
         let table = match interpolated.as_table() {
             Some(t) => t,
             None => return Err(Error::Lookup(format!("'{dotted_path}' is not a section"))),
@@ -397,21 +454,17 @@ impl Config {
     }
 
     /// Try to resolve every leaf value in the config; returns per-path
-    /// success/failure instead of stopping at the first error.
+    /// success/failure instead of stopping at the first error. If the file
+    /// has a `[ports]` section that fails to resolve (not in a git repo,
+    /// slots exhausted, ...), that failure becomes a `ports` row instead of
+    /// aborting validation of everything else.
     pub fn validate(&self) -> Vec<(String, bool, String)> {
-        let mut results = Vec::new();
-
-        #[allow(clippy::too_many_arguments)]
         fn walk(
+            cfg: &Config,
+            tree: &Value,
             node: &Value,
             prefix: &str,
-            config: &Value,
-            providers: &HashMap<String, ProviderSpec>,
-            sources: &HashMap<String, SourceSpec>,
-            merged_vars: &HashMap<String, String>,
-            config_dir: &Path,
             results: &mut Vec<(String, bool, String)>,
-            source_cache: &mut SourceCache,
         ) {
             match node {
                 Value::Table(map) => {
@@ -421,50 +474,21 @@ impl Config {
                         } else {
                             format!("{prefix}.{k}")
                         };
-                        walk(
-                            v,
-                            &path,
-                            config,
-                            providers,
-                            sources,
-                            merged_vars,
-                            config_dir,
-                            results,
-                            source_cache,
-                        );
+                        walk(cfg, tree, v, &path, results);
                     }
                 }
                 Value::Array(arr) => {
                     for (i, item) in arr.iter().enumerate() {
                         let path = format!("{prefix}[{i}]");
-                        walk(
-                            item,
-                            &path,
-                            config,
-                            providers,
-                            sources,
-                            merged_vars,
-                            config_dir,
-                            results,
-                            source_cache,
-                        );
+                        walk(cfg, tree, item, &path, results);
                     }
                 }
                 Value::String(s) => {
                     let resolving = HashSet::new();
-                    match interpolate_value(s, config, &resolving)
-                        .and_then(|v| eval_shell(&v, Some(config_dir)))
-                        .and_then(|v| {
-                            resolve_provider(
-                                &v,
-                                providers,
-                                sources,
-                                merged_vars,
-                                Some(config_dir),
-                                source_cache,
-                            )
-                            .map(|(val, _)| val)
-                        }) {
+                    match interpolate_value(s, tree, &resolving)
+                        .and_then(|v| eval_shell(&v, Some(&cfg.config_dir)))
+                        .and_then(|v| cfg.resolve_provider(&v).map(|(val, _)| val))
+                    {
                         Ok(_) => results.push((prefix.to_string(), true, String::new())),
                         Err(e) => results.push((prefix.to_string(), false, e.to_string())),
                     }
@@ -475,17 +499,15 @@ impl Config {
             }
         }
 
-        walk(
-            &self.tree,
-            "",
-            &self.tree,
-            &self.providers,
-            &self.sources,
-            &self.merged_vars,
-            &self.config_dir,
-            &mut results,
-            &mut self.source_cache.borrow_mut(),
-        );
+        let mut results = Vec::new();
+        let tree = match self.full_tree() {
+            Ok(tree) => tree,
+            Err(e) => {
+                results.push(("ports".to_string(), false, e.to_string()));
+                &self.tree
+            }
+        };
+        walk(self, tree, tree, "", &mut results);
         results
     }
 
@@ -496,8 +518,9 @@ impl Config {
         wrap: Option<&str>,
         reveal: bool,
     ) -> Result<String> {
-        let node = get(&self.tree, dotted_path)?;
-        let mut resolved = interpolate_node(node, &self.tree)?;
+        let tree = self.tree_for(dotted_path)?;
+        let node = get(tree, dotted_path)?;
+        let mut resolved = interpolate_node(node, tree)?;
         let mut secrets = HashSet::new();
         if eval_providers {
             resolved = eval_shells(&resolved, Some(&self.config_dir))?;
@@ -515,7 +538,8 @@ impl Config {
     }
 
     pub fn load(&self, eval_providers: bool) -> Result<Value> {
-        let interpolated = interpolate_node(&self.tree, &self.tree)?;
+        let tree = self.full_tree()?;
+        let interpolated = interpolate_node(tree, tree)?;
         if eval_providers {
             let evaled = eval_shells(&interpolated, Some(&self.config_dir))?;
             let mut secrets = HashSet::new();
@@ -718,7 +742,7 @@ mod tests {
 
         // main/master is unborn HEAD's symbolic ref by default in a fresh
         // `git init`, so slot should be 0 and app == band + lane.
-        let resolved = bc.ports.as_ref().unwrap();
+        let resolved = bc.ports().unwrap().unwrap();
         assert_eq!(resolved.infra["postgres"], 4300);
         assert_eq!(resolved.services["app"], 4300 + 50 + resolved.slot as i64);
         let branch = ports::current_branch(dir.path()).unwrap();
@@ -727,6 +751,72 @@ mod tests {
         // ports.* values are ordinary refs, resolvable from elsewhere in the file.
         let resolved = bc.resolve("db.url", false).unwrap();
         assert_eq!(resolved.value, "postgres://localhost:4300/mydb");
+    }
+
+    #[test]
+    #[serial]
+    fn test_ports_resolution_is_lazy() {
+        // NOT a git repo: with [ports] present, build must still succeed
+        // (shape validation is pure) and operations on sections that never
+        // reference ports must work -- the git/ledger work only happens
+        // when ports are actually used.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"
+            [ports]
+            band = 20000
+            [ports.services]
+            app = 50
+            [db]
+            host = "localhost"
+            "#,
+        );
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        assert_eq!(bc.resolve("db.host", true).unwrap().value, "localhost");
+        assert_eq!(bc.keys("db").unwrap(), vec!["host"]);
+
+        // Actually touching ports is where git is required.
+        let err = bc.resolve("ports.services.app", false).err().unwrap();
+        assert!(err.to_string().contains("git repo"), "got: {err}");
+        let err = bc.ports().unwrap_err();
+        assert!(err.to_string().contains("git repo"), "got: {err}");
+
+        // A malformed [ports] still fails at build, not first use.
+        let path = write_config(dir.path(), "[ports]\nband = \"nope\"");
+        let err = Config::build(Some(&path), &HashMap::new(), None)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("[ports]"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_transitive_ports_ref_resolves_from_unrelated_section() {
+        // db.url doesn't mention ports, but it references services.web.url
+        // which does -- the file-level "{ports." scan must catch this.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let path = write_config(
+            dir.path(),
+            r#"
+            [ports]
+            band = 20000
+            [ports.services]
+            web = 50
+            [services]
+            port = "{ports.services.web}"
+            [db]
+            url = "host:{services.port}"
+            "#,
+        );
+        let bc = Config::build(Some(&path), &HashMap::new(), None).unwrap();
+        assert_eq!(bc.resolve("db.url", false).unwrap().value, "host:20050");
     }
 
     #[test]

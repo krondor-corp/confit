@@ -1,5 +1,6 @@
 //! Every place confit shells out to `git` goes through here.
 
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -17,12 +18,14 @@ pub enum IgnoreStatus {
 /// A `git` invocation scoped to one working directory.
 pub struct Git {
     cwd: PathBuf,
+    common_dir: OnceCell<PathBuf>,
 }
 
 impl Git {
     pub fn new(cwd: impl AsRef<Path>) -> Self {
         Git {
             cwd: cwd.as_ref().to_path_buf(),
+            common_dir: OnceCell::new(),
         }
     }
 
@@ -33,11 +36,13 @@ impl Git {
             .output()
     }
 
-    /// The current branch name.
+    /// The current branch name, via `git symbolic-ref --short HEAD` (which
+    /// also works on an unborn HEAD, e.g. a freshly `git init`'d repo with
+    /// no commits yet).
     ///
-    /// Tries `git symbolic-ref --short HEAD` first (works on an unborn HEAD,
-    /// e.g. a freshly `git init`'d repo with no commits yet), falling back to
-    /// `git rev-parse --abbrev-ref HEAD` for a detached HEAD.
+    /// A detached HEAD is an error: there is no branch name, and pretending
+    /// otherwise (the string `"HEAD"`) would make every detached worktree
+    /// look like the same branch.
     pub fn current_branch(&self) -> Result<String> {
         let symbolic = self
             .run(&["symbolic-ref", "--short", "-q", "HEAD"])
@@ -46,17 +51,23 @@ impl Git {
             return Ok(String::from_utf8_lossy(&symbolic.stdout).trim().to_string());
         }
 
-        let output = self
-            .run(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .map_err(|e| Error::Runtime(format!("git rev-parse --abbrev-ref HEAD: {e}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::Runtime(format!(
-                "Could not determine the current git branch (are you in a git repo?): {}",
-                stderr.trim()
-            )));
+        // symbolic-ref failed: either detached HEAD (in a repo) or not a
+        // repo at all. Distinguish so the error says the right thing.
+        let in_repo = self
+            .run(&["rev-parse", "--git-dir"])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if in_repo {
+            Err(Error::Runtime(
+                "HEAD is detached (no branch checked out); \
+                 check out a branch, or create the worktree with `git worktree add -b <branch>`"
+                    .into(),
+            ))
+        } else {
+            Err(Error::Runtime(
+                "could not determine the current git branch (are you in a git repo?)".into(),
+            ))
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     /// Whether `path` is matched by a gitignore rule, via `git check-ignore`.
@@ -80,8 +91,12 @@ impl Git {
     /// The repo's common `.git` directory (absolute), shared by the main
     /// checkout and every `git worktree add`'d worktree of the same repo.
     /// The right place for machine-local, per-repo state that must be
-    /// visible from any worktree but never committed.
-    pub fn common_dir(&self) -> Result<PathBuf> {
+    /// visible from any worktree but never committed. Cached after the
+    /// first successful lookup.
+    pub fn common_dir(&self) -> Result<&Path> {
+        if let Some(cached) = self.common_dir.get() {
+            return Ok(cached);
+        }
         let output = self
             .run(&["rev-parse", "--git-common-dir"])
             .map_err(|e| Error::Runtime(format!("git rev-parse --git-common-dir: {e}")))?;
@@ -94,11 +109,12 @@ impl Git {
         }
         let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let path = PathBuf::from(raw);
-        Ok(if path.is_absolute() {
+        let path = if path.is_absolute() {
             path
         } else {
             self.cwd.join(path)
-        })
+        };
+        Ok(self.common_dir.get_or_init(|| path))
     }
 
     /// Every worktree of this repo (`git worktree list --porcelain`),
@@ -154,17 +170,7 @@ fn parse_worktree_list(porcelain: &str) -> Vec<Worktree> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
-        dir
-    }
+    use crate::testutil::{add_worktree, init_repo, init_repo_with_commit};
 
     #[test]
     fn test_current_branch_unborn_head() {
@@ -176,8 +182,21 @@ mod tests {
     #[test]
     fn test_current_branch_not_a_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let result = Git::new(dir.path()).current_branch();
-        assert!(result.is_err());
+        let err = Git::new(dir.path()).current_branch().unwrap_err();
+        assert!(err.to_string().contains("git repo"), "got: {err}");
+    }
+
+    #[test]
+    fn test_current_branch_detached_head_errors() {
+        let dir = init_repo_with_commit();
+        assert!(Command::new("git")
+            .args(["checkout", "-q", "--detach"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let err = Git::new(dir.path()).current_branch().unwrap_err();
+        assert!(err.to_string().contains("detached"), "got: {err}");
     }
 
     #[test]
@@ -204,50 +223,21 @@ mod tests {
 
     #[test]
     fn test_common_dir_is_shared_across_worktrees() {
-        let dir = init_repo();
-        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args([
-                "-c",
-                "user.email=t@t.com",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-q",
-                "-m",
-                "init",
-            ])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-
+        let dir = init_repo_with_commit();
         let extra = tempfile::tempdir().unwrap();
         let wt_path = extra.path().join("wt");
-        assert!(Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature/x",
-                wt_path.to_str().unwrap(),
-            ])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        add_worktree(dir.path(), &wt_path, "feature/x");
 
-        let main_common = Git::new(dir.path()).common_dir().unwrap();
-        let wt_common = Git::new(&wt_path).common_dir().unwrap();
+        let main_git = Git::new(dir.path());
+        let main_common = main_git.common_dir().unwrap().to_path_buf();
+        let wt_git = Git::new(&wt_path);
+        let wt_common = wt_git.common_dir().unwrap();
         assert_eq!(
             main_common.canonicalize().unwrap(),
             wt_common.canonicalize().unwrap()
         );
+        // Second call hits the cache and agrees.
+        assert_eq!(main_git.common_dir().unwrap(), main_common.as_path());
     }
 
     #[test]
@@ -276,43 +266,10 @@ mod tests {
 
     #[test]
     fn test_worktrees_multiple() {
-        let dir = init_repo();
-        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args([
-                "-c",
-                "user.email=t@t.com",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-q",
-                "-m",
-                "init",
-            ])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-
+        let dir = init_repo_with_commit();
         let extra = tempfile::tempdir().unwrap();
         let wt_path = extra.path().join("wt");
-        assert!(Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature/other",
-                wt_path.to_str().unwrap(),
-            ])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        add_worktree(dir.path(), &wt_path, "feature/other");
 
         let worktrees = Git::new(dir.path()).worktrees().unwrap();
         assert_eq!(worktrees.len(), 2);

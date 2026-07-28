@@ -49,24 +49,31 @@ impl Op for Validate {
             }
         }
         // If there's a [ports] section, also check it against this host:
-        // collisions, privileged/out-of-range ports, ports inside the
-        // host's ephemeral range, service ports already bound, and ledger
-        // corruption. Read-only and cheap, so there's no reason to gate it
-        // behind a flag or section filter.
-        if let Some(resolved) = &bc.ports {
-            let issues = confit_core::config::check_host(resolved, &bc.config_dir)?;
-            for issue in &issues {
-                let line = format!("ports.{}: {}", issue.path, issue.message);
-                match issue.severity {
-                    confit_core::config::Severity::Error => {
-                        ui::failure(&line);
-                        failures += 1;
+        // collisions, lane spacing, privileged/out-of-range ports, ports
+        // inside the host's ephemeral range, service ports already bound,
+        // and ledger corruption. Skipped when the user scoped validation to
+        // an unrelated section -- `confit validate db` must not fail on
+        // ports state it deliberately excluded.
+        let ports_in_scope = match &self.section {
+            None => true,
+            Some(s) => s == "ports" || s.starts_with("ports."),
+        };
+        if ports_in_scope {
+            if let Some(resolved) = bc.ports()? {
+                let issues = confit_core::config::check_host(resolved, &bc.config_dir)?;
+                for issue in &issues {
+                    let line = format!("ports.{}: {}", issue.path, issue.message);
+                    match issue.severity {
+                        confit_core::config::Severity::Error => {
+                            ui::failure(&line);
+                            failures += 1;
+                        }
+                        confit_core::config::Severity::Warning => ui::warning(&line),
                     }
-                    confit_core::config::Severity::Warning => ui::warning(&line),
                 }
-            }
-            if issues.is_empty() {
-                ui::success("ports: no issues found on this host");
+                if issues.is_empty() {
+                    ui::success("ports: no issues found on this host");
+                }
             }
         }
 

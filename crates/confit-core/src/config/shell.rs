@@ -13,6 +13,16 @@ use crate::error::{Error, Result};
 
 static SHELL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\((.+?)\)").unwrap());
 
+/// Run `cmd` via `sh -c` in `cwd`. The single place confit spawns a shell.
+pub(super) fn run_shell(cmd: &str, cwd: Option<&Path>) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new("sh");
+    command.args(["-c", cmd]);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command.output()
+}
+
 pub fn eval_shell(value: &str, cwd: Option<&Path>) -> Result<String> {
     if !value.contains("$(") {
         return Ok(value.to_string());
@@ -23,14 +33,8 @@ pub fn eval_shell(value: &str, cwd: Option<&Path>) -> Result<String> {
         let m = cap.get(0).unwrap();
         result.push_str(&value[last..m.start()]);
         let cmd = &cap[1];
-        let mut command = Command::new("sh");
-        command.args(["-c", cmd]);
-        if let Some(dir) = cwd {
-            command.current_dir(dir);
-        }
-        let output = command
-            .output()
-            .map_err(|e| Error::Runtime(format!("Shell eval $({cmd}): {e}")))?;
+        let output =
+            run_shell(cmd, cwd).map_err(|e| Error::Runtime(format!("Shell eval $({cmd}): {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::Runtime(format!(

@@ -12,6 +12,7 @@ description = "Generic config resolver with interpolation and provider evaluatio
 [workspace.dependencies]
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+fd-lock = "4"
 regex = "1"
 base64 = "0.22"
 tempfile = "3"

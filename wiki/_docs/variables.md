@@ -92,16 +92,17 @@ Variables are available in two places:
 
 ## error messages
 
-If you reference a variable that isn't set, confit tells you how to fix it:
+If you reference a variable that isn't declared, confit tells you how to
+fix it:
 
 ```bash
 $ confit resolve infra.endpoint
-Error: Variable 'stage' is not set. Define it in [vars] in confit.toml,
-pass --set stage=VALUE, or set CONFIT_VAR_STAGE
+Error: Variable 'stage' is not declared. Add it to [vars] in confit.toml
+(a default or ""), then override with --set stage=VALUE or CONFIT_VAR_STAGE
 ```
 
 This particular error only fires when you actually try to resolve a path
 that needs the variable -- reading `project.name` won't fail just because
-`stage` is unset. That's different from an *undeclared* `--set`/`CONFIT_VAR_*`
-name, which fails immediately (see above) regardless of which path you
-resolve.
+`stage` is undeclared. That's different from an *undeclared*
+`--set`/`CONFIT_VAR_*` name, which fails immediately (see above) regardless
+of which path you resolve.

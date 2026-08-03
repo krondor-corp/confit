@@ -69,18 +69,19 @@ impl Op for Show {
     type Error = ShowError;
 
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
+        let cfg = confit_core::config::Config::build(None, ctx.vars(), None)?;
+
         if self.yaml {
-            let output = confit_core::config::yaml_section(
+            let output = cfg.yaml_section(
                 &self.section,
                 !self.no_eval,
-                ctx.vars(),
                 self.wrap.as_deref(),
                 self.reveal,
             )?;
             return Ok(ShowOutput(output));
         }
 
-        let pairs = confit_core::config::env(&self.section, !self.no_eval, ctx.vars())?;
+        let pairs = cfg.env(&self.section, !self.no_eval)?;
         if self.upper {
             check_upper_collisions(&pairs)?;
         }

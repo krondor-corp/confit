@@ -3,7 +3,6 @@ use std::fmt;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use clap::{Args, ValueEnum};
 
@@ -126,29 +125,6 @@ fn json_quote(value: &str) -> String {
     out
 }
 
-enum GitignoreStatus {
-    Ignored,
-    NotIgnored,
-    /// Not a git repo, git unavailable, or otherwise undeterminable.
-    Unknown,
-}
-
-fn gitignore_status(path: &Path) -> GitignoreStatus {
-    match Command::new("git")
-        .args(["check-ignore", "-q", "--"])
-        .arg(path)
-        .output()
-    {
-        Ok(out) => match out.status.code() {
-            Some(0) => GitignoreStatus::Ignored,
-            Some(1) => GitignoreStatus::NotIgnored,
-            // 128 = not in a git work tree; anything else is unexpected.
-            _ => GitignoreStatus::Unknown,
-        },
-        Err(_) => GitignoreStatus::Unknown,
-    }
-}
-
 fn write_atomic(path: &Path, content: &str) -> Result<(), ExportError> {
     let io_err = |source| ExportError::Io {
         path: path.to_path_buf(),
@@ -196,26 +172,19 @@ impl Op for Export {
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
         // Compose the list of sections to resolve: the profile (if any) first,
         // then any explicit sections, so explicit sections win on conflict.
+        // A profile may also pin its own vars via [env.<name>.vars]; Config::build
+        // layers those in so e.g. `stage` resolves without --set at the call site.
         let mut paths: Vec<String> = Vec::new();
-        let mut profile_vars = HashMap::new();
         if let Some(name) = &self.profile {
-            let profile_path = format!("env.{name}");
-            // A profile may pin its own vars via [env.<name>.vars]; layer them in
-            // so e.g. `stage` resolves without `--set` at the call site.
-            profile_vars = confit_core::config::read_profile_vars(&profile_path)?;
-            paths.push(profile_path);
+            paths.push(format!("env.{name}"));
         }
         paths.extend(self.sections.iter().cloned());
         if paths.is_empty() {
             return Err(ExportError::NoSource);
         }
 
-        let pairs = confit_core::config::env_multi_with_vars(
-            &paths,
-            &profile_vars,
-            !self.no_eval,
-            ctx.vars(),
-        )?;
+        let cfg = confit_core::config::Config::build(None, ctx.vars(), self.profile.as_deref())?;
+        let pairs = cfg.env_multi(&paths, !self.no_eval)?;
         if self.upper {
             check_upper_collisions(&pairs)?;
         }
@@ -249,11 +218,11 @@ impl Op for Export {
 
         match &self.out {
             Some(path) => {
-                match gitignore_status(path) {
-                    GitignoreStatus::NotIgnored if !self.force => {
+                match confit_core::git::Git::new(".").check_ignore(path) {
+                    confit_core::git::IgnoreStatus::NotIgnored if !self.force => {
                         return Err(ExportError::NotGitignored(path.display().to_string()));
                     }
-                    GitignoreStatus::Unknown => {
+                    confit_core::git::IgnoreStatus::Unknown => {
                         ui::warning(&format!(
                             "could not confirm '{}' is gitignored (not a git repo?); writing anyway",
                             path.display()

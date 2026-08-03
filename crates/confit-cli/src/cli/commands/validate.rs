@@ -33,7 +33,8 @@ impl Op for Validate {
     type Error = ValidateError;
 
     fn run(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error> {
-        let mut results = confit_core::config::validate(ctx.vars())?;
+        let bc = confit_core::config::Config::build(None, ctx.vars(), None)?;
+        let mut results = bc.validate();
         if let Some(ref s) = self.section {
             let prefix = format!("{s}.");
             results.retain(|(p, _, _)| p == s || p.starts_with(&prefix));
@@ -47,6 +48,35 @@ impl Op for Validate {
                 failures += 1;
             }
         }
+        // If there's a [ports] section, also check it against this host:
+        // collisions, lane spacing, privileged/out-of-range ports, ports
+        // inside the host's ephemeral range, service ports already bound,
+        // and ledger corruption. Skipped when the user scoped validation to
+        // an unrelated section -- `confit validate db` must not fail on
+        // ports state it deliberately excluded.
+        let ports_in_scope = match &self.section {
+            None => true,
+            Some(s) => s == "ports" || s.starts_with("ports."),
+        };
+        if ports_in_scope {
+            if let Some(resolved) = bc.ports()? {
+                let issues = confit_core::config::check_host(resolved, &bc.config_dir)?;
+                for issue in &issues {
+                    let line = format!("ports.{}: {}", issue.path, issue.message);
+                    match issue.severity {
+                        confit_core::config::Severity::Error => {
+                            ui::failure(&line);
+                            failures += 1;
+                        }
+                        confit_core::config::Severity::Warning => ui::warning(&line),
+                    }
+                }
+                if issues.is_empty() {
+                    ui::success("ports: no issues found on this host");
+                }
+            }
+        }
+
         if failures > 0 {
             return Err(ValidateError::Failures(failures));
         }

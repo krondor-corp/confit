@@ -1,0 +1,18 @@
+namespace: krondor_corp
+name: confit
+# Not used by git installs (they pin a tag); kept in step with the crates.
+version: 0.5.0
+readme: README.md
+authors:
+  - krondor-corp
+description: Read confit.toml from Ansible playbooks as the `confit` variable.
+license:
+  - MIT
+repository: https://github.com/krondor-corp/confit
+tags:
+  - config
+  - secrets
+  - onepassword
+dependencies: {}
+build_ignore:
+  - tests

@@ -18,3 +18,4 @@
   items:
     - recipes
     - 1password-environments
+    - ansible
